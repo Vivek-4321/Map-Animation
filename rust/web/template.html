@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#F2F0EA">
+<title>Map Editor</title>
+<script>try{const t=localStorage.getItem("studio-theme");if(t)document.documentElement.dataset.theme=t}catch{}</script>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.6.0/dist/maplibre-gl.css">
+<link rel="stylesheet" href="css/template.css">
+<script src="https://unpkg.com/maplibre-gl@5.6.0/dist/maplibre-gl.js"></script>
+<script type="module" src="js/template.js"></script>
+</head>
+<body>
+<!-- the home screen: something new, the library, the example (the editor loads behind it) -->
+<div class="home" id="home" hidden>
+  <canvas class="chart" id="homeChart" aria-hidden="true"></canvas>
+  <header class="home-head">
+    <span class="brand">
+      <svg viewBox="0 0 12 8" width="24" height="16" shape-rendering="crispEdges" aria-hidden="true">
+        <path d="M0 1h1v1H0zM1 0h2v1H1zM3 1h1v1H3zM4 2h2v1H4zM6 1h1v1H6zM7 0h2v1H7zM9 1h1v1H9zM10 2h2v1h-2zM0 5h1v1H0zM1 4h2v1H1zM3 5h1v1H3zM4 6h2v1H4zM6 5h1v1H6zM7 4h2v1H7zM9 5h1v1H9zM10 6h2v1h-2z"/>
+      </svg>
+      <span>Map Editor</span>
+    </span>
+    <div class="grow"></div>
+    <button class="ghost" id="homeBack" hidden>Back to the editor</button>
+    <button class="icon-btn" id="homeTheme"></button>
+  </header>
+  <main class="home-body">
+    <section class="home-hero">
+      <p class="eyebrow" id="homeHi">Map Editor</p>
+      <h1>Your trip, as a map video.</h1>
+      <p class="lede">Add the places, pick a look, and the engine draws the route between them, frame by frame, in this tab.</p>
+      <div class="home-cta">
+        <button class="go big" id="homeNew">Create new <svg class="arr" viewBox="0 0 10 10" aria-hidden="true"><path d="M3 2h5v5M8 2 2 8"/></svg></button>
+        <button class="ghost big" id="homeExample">Try an example</button>
+      </div>
+    </section>
+    <section class="home-sec">
+      <div class="home-sec-h"><p class="eyebrow">Library</p><span class="count" id="homeCount"></span></div>
+      <div class="home-grid" id="homeList"></div>
+    </section>
+  </main>
+</div>
+<div class="app">
+  <header class="head">
+    <button class="brand" id="homeBtn" title="Home: the library and something new">
+      <svg viewBox="0 0 12 8" width="24" height="16" shape-rendering="crispEdges" aria-hidden="true">
+        <path d="M0 1h1v1H0zM1 0h2v1H1zM3 1h1v1H3zM4 2h2v1H4zM6 1h1v1H6zM7 0h2v1H7zM9 1h1v1H9zM10 2h2v1h-2zM0 5h1v1H0zM1 4h2v1H1zM3 5h1v1H3zM4 6h2v1H4zM6 5h1v1H6zM7 4h2v1H7zM9 5h1v1H9zM10 6h2v1h-2z"/>
+      </svg>
+      <span>Map Editor</span>
+    </button>
+    <span class="slash">/</span>
+    <input id="title" class="title" placeholder="Untitled trip" spellcheck="false" maxlength="60" aria-label="Title (optional)">
+    <span class="tpl-tag" id="tplTag" title="The template this is made with"></span>
+    <div class="grow"></div>
+    <div class="seg" id="shape" role="group" aria-label="Video shape">
+      <button data-shape="16:9" class="on"><i class="shape-ico" style="--w: 16; --h: 9"></i>16:9</button>
+      <button data-shape="9:16"><i class="shape-ico" style="--w: 9; --h: 16"></i>9:16</button>
+      <button data-shape="1:1"><i class="shape-ico" style="--w: 1; --h: 1"></i>1:1</button>
+    </div>
+    <button class="icon-btn" id="themeBtn"></button>
+    <button class="go" id="exportBtn" disabled>Export video <svg class="arr" viewBox="0 0 10 10" aria-hidden="true"><path d="M3 2h5v5M8 2 2 8"/></svg></button>
+  </header>
+
+  <aside class="side">
+    <section class="block">
+      <div class="block-h"><p class="eyebrow">Stops</p><span class="stop-count" id="stopCount"></span></div>
+      <!-- a place to add, or a GPX track (also dropped anywhere on the panel): each track becomes a leg -->
+      <div class="find-row">
+        <div class="place-field">
+          <svg class="search-ico" viewBox="0 0 7 7" shape-rendering="crispEdges" aria-hidden="true"><path d="M1 0h3v1H1zM0 1h1v3H0zM4 1h1v3H4zM1 4h3v1H1zM5 5h1v1H5zM6 6h1v1H6z"/></svg>
+          <input id="search" class="field" placeholder="Search or tap the map">
+        </div>
+        <button type="button" class="gpx-btn" id="gpxBtn" title="Add GPX tracks, or drop .gpx files here: each track becomes a leg"><svg class="px" viewBox="0 0 7 7" aria-hidden="true"><path d="M3 0h1v4H3zM1 2h1v1H1zM5 2h1v1H5zM2 3h1v1H2zM4 3h1v1H4zM0 6h7v1H0zM0 5h1v1H0zM6 5h1v1H6z"/></svg>GPX</button>
+        <input type="file" id="gpxFile" accept=".gpx,application/gpx+xml" multiple hidden>
+      </div>
+      <ol class="stops" id="stops"></ol>
+      <div class="empty" id="empty">
+        <svg class="empty-art" viewBox="0 0 22 14" shape-rendering="crispEdges" aria-hidden="true">
+          <path class="sail" d="M10 0h1v1h-1zM10 1h2v1h-2zM10 2h3v1h-3zM10 3h4v1h-4zM10 4h5v1h-5zM10 5h6v1h-6zM7 2h2v1H7zM6 3h3v1H6zM5 4h4v1H5zM4 5h5v1H4z"/>
+          <path class="mast" d="M9 0h1v7H9z"/>
+          <path class="hull" d="M3 7h16v1H3zM4 8h14v1H4zM5 9h12v1H5z"/>
+          <path class="sea" d="M0 11h2v1H0zM4 11h3v1H4zM9 12h3v1H9zM14 11h3v1h-3zM19 12h3v1h-3zM2 13h2v1H2zM12 13h2v1h-2z"/>
+        </svg>
+        <p>Add at least two stops.</p>
+        <button class="ghost" id="exampleBtn">Try an example trip</button>
+      </div>
+    </section>
+
+    <!-- the Story template's own choices, for the whole trip: each opens its picker, which shows it -->
+    <section class="block story-only" id="storyBlock">
+      <div class="block-h"><p class="eyebrow">Story</p><p class="hint-inline">Click one to see the choices</p></div>
+      <div class="story-choices" id="storyChoices"></div>
+      <label class="row">Camera
+        <span class="seg small" id="storyCamera" role="group" aria-label="Camera"></span>
+      </label>
+    </section>
+
+    <section class="block">
+      <p class="eyebrow">Look</p>
+      <label class="row">Route colour
+        <span class="swatch"><input type="color" id="color" value="#00a9df"></span>
+      </label>
+      <label class="row">Length
+        <span class="range"><input type="range" id="duration" min="0" max="60" step="1" value="0"><output id="durationOut">Auto</output></span>
+      </label>
+      <label class="row not-story">Camera
+        <select id="camera" class="field small">
+          <option value="fit">Fit each leg</option>
+          <option value="close">Stay close</option>
+        </select>
+        <span class="seg small" id="trailCamera" role="group" aria-label="Camera"></span>
+      </label>
+      <label class="row" id="distanceRow" hidden>Camera distance
+        <span class="range"><input type="range" id="distance" min="0.4" max="1.6" step="0.05" value="1" aria-label="Camera distance: closer to the left, farther to the right"><output id="distanceOut">As set</output></span>
+      </label>
+    </section>
+
+    <p class="side-foot">The film is drawn by the Map Studio engine, in this tab. Real routes come from OpenStreetMap's free routers (BRouter, OSRM, Valhalla) · © OpenStreetMap contributors.</p>
+  </aside>
+
+  <main class="stage">
+    <canvas class="chart" id="chart" aria-hidden="true"></canvas>
+    <div class="tabs seg" role="tablist">
+      <button data-tab="map" class="on">Map</button>
+      <button data-tab="preview">Preview</button>
+    </div>
+    <div class="pane" id="mapPane">
+      <div id="routeMap"></div>
+      <div class="map-tools seg" role="group" aria-label="Undo and redo">
+        <button type="button" id="undoBtn" title="Undo (⌘Z)" aria-label="Undo" disabled></button>
+        <button type="button" id="redoBtn" title="Redo (⇧⌘Z)" aria-label="Redo" disabled></button>
+      </div>
+      <p class="map-hint" id="mapHint" role="status"></p>
+    </div>
+    <div class="pane" id="previewPane">
+      <div class="frame" id="frame">
+        <canvas id="canvas"></canvas>
+        <div class="veil" id="veil"><canvas class="veil-sea" id="veilSea" aria-hidden="true"></canvas><span id="veilText">Starting the engine…</span></div>
+        <span class="busy" id="busy" role="status" hidden></span>
+        <div class="showcase-cap" id="showcaseCap" hidden><div class="cap-body"><b id="showcaseName"></b><span class="cap-note" id="showcaseAbout"></span></div></div>
+      </div>
+      <div class="transport">
+        <button class="play" id="playBtn" aria-label="Play or pause" disabled></button>
+        <input type="range" id="scrub" min="0" max="1" step="0.01" value="0" aria-label="Time" disabled>
+        <span class="time" id="time">0.0 / 0.0 s</span>
+        <select id="quality" class="field small" title="Preview quality (the export renders at its own size)">
+          <option value="540">540p</option>
+          <option value="720">720p</option>
+          <option value="1080">1080p</option>
+        </select>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- a Story choice's picker: its choices, each shown in the preview by the engine as it's pointed at -->
+<aside class="picker" id="picker" hidden aria-label="Choices">
+  <div class="picker-h">
+    <p class="eyebrow" id="pickerEyebrow"></p>
+    <h2 id="pickerTitle"></h2>
+  </div>
+  <div class="picker-list" id="pickerList" role="listbox"></div>
+  <div class="picker-foot">
+    <button type="button" class="ghost" id="pickerCancel">Cancel</button>
+    <button type="button" class="go" id="pickerUse">Use this</button>
+  </div>
+</aside>
+
+<!-- the templates: what something new is made with -->
+<dialog id="tplDlg" class="tpl-dlg">
+  <p class="eyebrow" id="tplEyebrow">Create new</p>
+  <h2>Pick a template</h2>
+  <div class="tpl-grid" id="tplGrid"></div>
+  <div class="actions"><button type="button" class="ghost" id="tplClose">Cancel</button></div>
+</dialog>
+
+<dialog id="exportDlg">
+  <form method="dialog">
+    <!-- before: the film's size -->
+    <div id="setup">
+      <p class="eyebrow">Export</p>
+      <h2>Your film</h2>
+      <label class="row">Size
+        <select id="exportSize" class="field small">
+          <option value="720">720p</option>
+          <option value="1080">1080p</option>
+        </select>
+      </label>
+      <label class="row">Frame rate
+        <select id="exportFps" class="field small">
+          <option value="30">30 fps</option>
+          <option value="60">60 fps</option>
+        </select>
+      </label>
+      <p class="note">The engine renders every frame in this tab. Keep it open until it's done.</p>
+      <div class="actions">
+        <button value="close" class="ghost">Close</button>
+        <button type="button" class="go" id="renderBtn">Render <svg class="arr" viewBox="0 0 10 10" aria-hidden="true"><path d="M3 2h5v5M8 2 2 8"/></svg></button>
+      </div>
+    </div>
+    <!-- while and after: the route drawn on a pixel globe as far as the frames are -->
+    <div id="run" hidden aria-live="polite">
+      <div class="art"><canvas id="exportArt" aria-hidden="true"></canvas><span class="art-tag" id="vPhase">Charting</span></div>
+      <div class="run-h"><h2 id="vTitle">Rendering</h2><p class="pct"><b id="vPct">0</b>%</p></div>
+      <div class="bar"><i id="bar"></i></div>
+      <p class="v-line" id="progressText"></p>
+      <dl class="facts">
+        <div><dt>Frames</dt><dd id="vFrames">–</dd></div>
+        <div><dt id="vLeftName">Time left</dt><dd id="vLeft">–</dd></div>
+        <div><dt>Film</dt><dd id="vSize">–</dd></div>
+      </dl>
+      <p class="note" id="exportNote"></p>
+      <div class="actions">
+        <button type="button" class="ghost" id="closeBtn">Cancel</button>
+        <button type="button" class="ghost" id="againBtn" hidden>Render again</button>
+        <a class="go" id="downloadLink" hidden>Download MP4 <svg class="arr" viewBox="0 0 10 10" aria-hidden="true"><path d="M5 1v7M2 5l3 3 3-3"/></svg></a>
+      </div>
+    </div>
+  </form>
+</dialog>
+<div class="toast" id="toast" hidden></div>
+</body>
+</html>

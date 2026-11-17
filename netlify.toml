@@ -1,0 +1,5 @@
+[[redirects]]
+  from = "/"
+  to = "/rust/web/template.html"
+  status = 302
+  force = true
