@@ -516,6 +516,19 @@ function startTileWorkers(module) {
   if (typeof Worker !== "function") return;
   const n = Math.min(4, Math.max(1, Math.floor((self.navigator?.hardwareConcurrency || 4) / 2)));
   st.tileWorkers = [];
+  // One that would not start, or that stopped, takes the tiles it was given with it, and the pool's
+  // messages are spread over all of them: the pool goes, and the engine builds the map's tiles itself
+  // from then on (an export waiting on them looks again, and draws its frame complete).
+  const lost = (why) => {
+    if (!st.tileWorkers?.length) return;
+    console.warn(`map tile workers: ${why}; the map's tiles are built here from now on`);
+    for (const t of st.tileWorkers) t.terminate();
+    st.tileWorkers = [];
+    if (!st.dead && st.engine) st.engine.tile_workers_lost();
+    st.tileAnswer?.();
+    st.dirty = true;
+    wake();
+  };
   for (let i = 0; i < n; i++) {
     const w = new Worker(new URL("./map-tile-worker.js", import.meta.url), { type: "module" });
     const rows = Array.from(st.engine.tile_worker_fonts());
@@ -529,8 +542,13 @@ function startTileWorkers(module) {
         // a frame takes the tile up
         st.dirty = true;
         wake();
-      } else if (e.data.kind === "init-failed") console.warn(`map tile worker: ${e.data.error}`);
+      } else if (e.data.kind === "init-failed") lost(`one would not start (${e.data.error})`);
     };
+    w.onerror = (ev) => {
+      ev?.preventDefault?.();
+      lost(`one stopped (${ev?.message || "an error"})`);
+    };
+    w.onmessageerror = () => lost("an answer could not be read");
     st.tileWorkers.push(w);
   }
   st.engine.set_tile_workers(n);
@@ -994,6 +1012,9 @@ const WARM_AT_ONCE = 12;
 /** `src`'s bytes for an export: the preview's load workers' cached copy while fresh (a plain fetch doesn't
  * consult Cache Storage, and would download it again), else the network, given up after
  * `READ_TIMEOUT_MS` or when `signal` aborts. `null`: the server has none, or it failed. */
+/** `src`'s bytes for an export, from the preview's cache while fresh, else fetched (a stale copy standing in
+ * when the network fails), with the server's status: `{ bytes, status }` (`bytes` null when it had none).
+ * A network error or the timeout throws. */
 async function fetchSource(src, cache, signal) {
   const url = sourceUrl(src);
   const hit = await cache?.match(url).catch(() => null);
@@ -1010,8 +1031,15 @@ async function fetchSource(src, cache, signal) {
       r = hit;
     }
   }
-  return r.ok ? new Uint8Array(await r.arrayBuffer()) : null;
+  return { bytes: r.ok ? new Uint8Array(await r.arrayBuffer()) : null, status: r.status };
 }
+
+/** How often an export asks again for a read that failed for now (no answer, a timeout, a server busy or
+ * failing) before it settles it as missing, and the first wait between (doubled each time). */
+const READ_RETRIES = 3;
+const READ_RETRY_MS = 1000;
+/** A failed read worth asking again: none came back (status 0), or the server said to try later. */
+const retryable = (status) => status === 0 || status === 408 || status === 425 || status === 429 || status >= 500;
 
 /** The longest one of an export's fetches is waited on. */
 const READ_TIMEOUT_MS = 60_000;
@@ -1131,26 +1159,41 @@ function exportReads(e, files, tiles, format, stage) {
     if (tileSrcs.has(src) && stage?.put(src, STAGED_BYTES, bytes)) e.put_export_staged(src);
     else e.put_export_bytes(src, bytes);
   };
+  // One read, in: its bytes (or a tile's levels) put to the engine. A read that failed for now (`retryable`)
+  // is asked again, a few times, the waits growing, before the engine is told it is missing: the engine
+  // settles a source it's told failed for the rest of the export, so one dropped connection or busy
+  // server must not cost a tile for the whole film. One the server hasn't (a 404) is missing at once.
   const load = async (src) => {
-    if (stopped) return;
-    try {
-      if (format && tileSrcs.has(src)) {
-        const m = await Promise.race([levelsOf(src), stopping]);
-        if (stopped || !m) return;
-        // the store takes the levels as they are; the bytes only stand in for levels it can't take
-        const levelled = m.levels && (stage?.put(src, STAGED_LEVELS, m.levels)
-          ? e.put_export_staged_levels(src, m.levels.byteLength)
-          : e.put_export_levels(src, m.levels));
-        if (!levelled && m.bytes) putBytes(src, m.bytes);
-        else if (!levelled) e.put_export_failed(src);
-        return;
-      }
-      const bytes = await fetchSource(src, await cache, abort.signal);
+    for (let attempt = 0; ; attempt++) {
       if (stopped) return;
-      if (bytes) putBytes(src, bytes);
-      else e.put_export_failed(src);
-    } catch {
-      if (!stopped) e.put_export_failed(src);
+      let status;
+      try {
+        if (format && tileSrcs.has(src)) {
+          const m = await Promise.race([levelsOf(src), stopping]);
+          if (stopped || !m) return;
+          if (m.failed !== undefined) {
+            status = m.status ?? 0;
+          } else {
+            // the store takes the levels as they are; the bytes only stand in for levels it can't take
+            const levelled = m.levels && (stage?.put(src, STAGED_LEVELS, m.levels)
+              ? e.put_export_staged_levels(src, m.levels.byteLength)
+              : e.put_export_levels(src, m.levels));
+            if (!levelled && m.bytes) putBytes(src, m.bytes);
+            else if (!levelled) e.put_export_failed(src);
+            return;
+          }
+        } else {
+          const got = await fetchSource(src, await cache, abort.signal);
+          if (stopped) return;
+          if (got.bytes) return putBytes(src, got.bytes);
+          status = got.status;
+        }
+      } catch {
+        if (stopped) return;
+        status = 0;
+      }
+      if (attempt >= READ_RETRIES || !retryable(status)) return e.put_export_failed(src);
+      await Promise.race([new Promise((r) => setTimeout(r, READ_RETRY_MS << attempt)), stopping]);
     }
   };
   let endStopping;
@@ -1188,11 +1231,25 @@ function exportReads(e, files, tiles, format, stage) {
       progress(0, need.length);
       pump();
       // a few lanes, each taking the next source as its last is in: what is out at once stays bounded
-      // (and, with a stage, what is held: each lands on disk as it comes)
+      // (and, with a stage, what is held: each lands on disk as it comes). Every map tile is in before
+      // the first frame, so what can't go on disk (no stage, or a write that failed) is held: once that
+      // reaches READS_BUDGET no more tiles start and the export fails, rather than filling the browser's
+      // memory until it gives out.
       let at = 0;
+      let over = false;
       const lane = async () => {
-        while (!stopped && at < need.length) {
-          await get1(need[at++]);
+        while (!stopped && !over && at < need.length) {
+          const src = need[at];
+          if (tileSrcs.has(src) && e.export_held_bytes() >= READS_BUDGET) {
+            over = true;
+            throw new Error(
+              "This film's map needs more memory than the browser can hold for it" +
+                (stage ? "" : " (it has no private storage to keep the map's tiles on)") +
+                ". Try a shorter film or a smaller size.",
+            );
+          }
+          at++;
+          await get1(src);
           progress(++n, need.length);
         }
       };

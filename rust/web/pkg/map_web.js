@@ -810,6 +810,13 @@ export class WebEngine {
         return ret;
     }
     /**
+     * The tile workers have failed (one would not start, or stopped): the map's tiles are built here
+     * from now on (`Engine::tile_workers_lost`).
+     */
+    tile_workers_lost() {
+        wasm.webengine_tile_workers_lost(this.__wbg_ptr);
+    }
+    /**
      * The map tiles the frame on screen still waits for (`Engine::tiles_pending`, strict): the imagery
      * alone, apart from the other loads `pending` counts.
      * @returns {number}
@@ -1229,6 +1236,30 @@ export function startup_files() {
     var v1 = getArrayJsValueFromWasm0(ret[0], ret[1]);
     wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
     return v1;
+}
+
+/**
+ * [`tile_is_no_data`] and then [`tile_levels`], from one mip chain (`map_render::tiles::encode_tile`, its
+ * 8x8 level what the placeholder test reads): the joined levels, empty for the "no imagery" placeholder,
+ * `None` for a tile that can't be compressed in `format`. A tile from a source that sends the
+ * placeholder (ArcGIS) is halved once, not twice.
+ * @param {string} url
+ * @param {Uint8Array} rgba
+ * @param {number} format
+ * @returns {Uint8Array | undefined}
+ */
+export function tile_encode(url, rgba, format) {
+    const ptr0 = passStringToWasm0(url, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passArray8ToWasm0(rgba, wasm.__wbindgen_malloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.tile_encode(ptr0, len0, ptr1, len1, format);
+    let v3;
+    if (ret[0] !== 0) {
+        v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    }
+    return v3;
 }
 
 /**
@@ -3569,18 +3600,18 @@ function __wbg_get_imports() {
             arg0.writeTexture(arg1, getArrayU8FromWasm0(arg2, arg3), arg4, arg5);
         }, arguments); },
         __wbindgen_generic_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 2457, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 2474, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue______true_);
             return ret;
         },
         __wbindgen_generic_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 4458, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 4475, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue__core_ed718c3d60ebd546___result__Result_____wasm_bindgen_d5062a7ed11bff87___JsError___true_);
             return ret;
         },
         __wbindgen_generic_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("GPUUncapturedErrorEvent")], shim_idx: 2457, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue______true__107);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("GPUUncapturedErrorEvent")], shim_idx: 2474, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue______true__109);
             return ret;
         },
         __wbindgen_generic_0000000000000004: function(arg0) {
@@ -3648,8 +3679,8 @@ function wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bin
     wasm.wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue______true_(arg0, arg1, arg2);
 }
 
-function wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue______true__107(arg0, arg1, arg2) {
-    wasm.wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue______true__107(arg0, arg1, arg2);
+function wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue______true__109(arg0, arg1, arg2) {
+    wasm.wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue______true__109(arg0, arg1, arg2);
 }
 
 function wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue__core_ed718c3d60ebd546___result__Result_____wasm_bindgen_d5062a7ed11bff87___JsError___true_(arg0, arg1, arg2) {

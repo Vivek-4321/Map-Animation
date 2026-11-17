@@ -5,7 +5,7 @@
 //
 // Tiles: fetch through the HTTP cache, decode with the engine's own decoder (decode_tile, the one the
 // Android tile workers run), and post 256×256 RGBA back, its buffer transferred; for a compressed store
-// (the job's `format`), its mip chain compressed as Android's tile threads compress it (tile_levels) instead.
+// (the job's `format`), its mip chain compressed as Android's tile threads compress it (tile_encode: the placeholder test and the levels from one chain) instead.
 // An export's tiles ("levels" jobs) come back as both: the bytes and the compressed chain. Files: fetch and post the
 // bytes. Downloads from other origins are kept in Cache Storage (the app's disk cache on Android) for as
 // long as the shells' one rule says (source_max_age_s: a day for a TileJSON or a style, 30 days for a tile);
@@ -14,7 +14,7 @@
 //
 // Every download has a deadline, body and all, and a size: a stalled one is failed (the engine asks again
 // later), and none is read past what it may be, whatever its Content-Length said.
-import init, { detail_build, cpu_build, decode_tile, tile_is_no_data, tile_levels, source_max_age_s, retry_after_s } from "../pkg/map_web.js";
+import init, { detail_build, cpu_build, decode_tile, tile_is_no_data, tile_encode, source_max_age_s, retry_after_s } from "../pkg/map_web.js";
 
 const CACHE = "map-http-v1";
 /** when a cached response was stored (ms since the epoch): its age is read from it */
@@ -69,10 +69,22 @@ self.onmessage = async (e) => {
     ctl?.abort();
     return;
   }
+  // A job is cancellable from when it comes, not from when the module has started: the pool frees its slot
+  // the moment it cancels, so one cancelled while this worker starts must not run after (unanswered, as
+  // any cancelled job). Until it starts, a stand-in under its key hears the cancel.
+  const key = jobKey(m);
+  const early = key === undefined ? null : new AbortController();
+  if (early) running.set(key, early);
   try {
     await ready;
   } catch (err) {
+    if (early && running.get(key) !== early) return;
+    if (early) running.delete(key);
     return answerFailed(m, `the load worker did not start (${err?.message ?? err})`);
+  }
+  if (early) {
+    if (running.get(key) !== early) return; // cancelled while the worker started
+    running.delete(key);
   }
   if (m.kind === "tile") tile(m);
   else if (m.kind === "levels") levels(m);
@@ -80,6 +92,14 @@ self.onmessage = async (e) => {
   else if (m.kind === "detail") detail(m);
   else if (m.kind === "cpu") cpu(m);
 };
+
+/** The key a job runs under, as its cancel names it (`guarded`); none for one that can't be cancelled. */
+function jobKey(m) {
+  if (m.kind === "tile") return m.id;
+  if (m.kind === "levels") return `l${m.id}`;
+  if (m.kind === "file") return `f${m.id}`;
+  return undefined;
+}
 
 /** A job this worker can't run, answered as failed (a file as having no response: asked again later). */
 function answerFailed(m, why) {
@@ -273,8 +293,10 @@ function tile({ id, url, format }) {
       if (!r.bytes) return post({ kind: "tile", id, failed: `HTTP ${r.status}` });
       const rgba = decode_tile(r.bytes);
       if (!rgba) return post({ kind: "tile", id, failed: "the tile does not decode" });
-      if (tile_is_no_data(url, rgba)) return post({ kind: "tile", id, noData: true });
-      const lv = format ? tile_levels(rgba, format) : null;
+      // compressed for the store: the placeholder test and the levels from one mip chain (an empty answer
+      // is the placeholder); for a store of plain pixels, the placeholder test alone
+      const lv = format ? tile_encode(url, rgba, format) : null;
+      if (format ? lv?.length === 0 : tile_is_no_data(url, rgba)) return post({ kind: "tile", id, noData: true });
       if (lv) return post({ kind: "tile", id, levels: lv }, [lv.buffer]);
       post({ kind: "tile", id, rgba }, [rgba.buffer]);
     },
@@ -286,16 +308,24 @@ function tile({ id, url, format }) {
  * again) and its chain compressed in `format`. One that is no imagery, or doesn't decode, comes back with its
  * bytes alone: the export decides about it as it would have. */
 function levels({ id, url, format }) {
-  const failed = (err) => post({ kind: "levels", id, failed: String(err?.message ?? err) });
+  // `status`: the server's answer (0: none, a network error or the deadline), so the export can tell a tile
+  // worth asking again from one that isn't there; too large is as good as missing, busy here is asked again
+  const failed = (err, status = 0) => {
+    if (err instanceof TooLarge) status = 413;
+    else if (err instanceof Busy) status = 429;
+    post({ kind: "levels", id, failed: String(err?.message ?? err), status });
+  };
   return downloadJob(
     `l${id}`,
     TILE_DEADLINE_MS,
     url,
     TILE_MAX_BYTES,
     (r) => {
-      if (!r.bytes) return failed(`HTTP ${r.status}`);
+      if (!r.bytes) return failed(`HTTP ${r.status}`, r.status);
       const rgba = decode_tile(r.bytes);
-      const lv = rgba && !tile_is_no_data(url, rgba) ? tile_levels(rgba, format) : null;
+      // (the placeholder test and the levels from one mip chain: an empty answer is the placeholder)
+      const encoded = rgba ? tile_encode(url, rgba, format) : null;
+      const lv = encoded?.length ? encoded : null;
       post({ kind: "levels", id, bytes: r.bytes, levels: lv }, lv ? [r.bytes.buffer, lv.buffer] : [r.bytes.buffer]);
     },
     failed,
