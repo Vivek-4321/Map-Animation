@@ -103,6 +103,7 @@ const KINDS = {
   label: ["Place labels", "How place names come in"],
   entrance: ["Photo entrance", "How the photo comes in"],
   style: ["Map style", "Pick a map style"],
+  marker: ["Stop marker", "How each stop is marked"],
 };
 /** a stop's or leg's own choice "": the trip's; the trip's own "none" where the catalogue has no such choice */
 const TRIPS = { key: "", name: "Trip's choice", about: "As set for the whole trip, in Story." };
@@ -143,7 +144,7 @@ const curvedLegs = () => state.template !== "orbit";
 const isStory = () => state.template === "story";
 
 const state = { template: "orbit", title: "", shape: "16:9", color: "#00a9df", duration: 0, camera: "fit", trailCamera: "orbit", trailDistance: 1,
-  swap: "smooth", highlight: "flag", labelStyle: "stamp", effect: "none", mapStyle: "Maps", storyCamera: "steady", stops: [] };
+  swap: "smooth", highlight: "flag", labelStyle: "stamp", effect: "none", mapStyle: "Maps", stopMarker: "disc", storyCamera: "steady", stops: [] };
 let nextId = 1;
 let preview = null;
 let rebuildVersion = 0;
@@ -619,6 +620,7 @@ async function travelJson() {
     style: state.mapStyle, duration: state.duration || storyLength() };
   if (state.labelStyle !== "none") meta.labelStyle = state.labelStyle;
   if (state.effect !== "none") meta.effect = state.effect;
+  if (state.stopMarker === "dot") meta.marker = "dot";
   if (state.highlight === "flag") meta.flags = true;
   if (state.highlight === "color") meta.highlight = "color";
   return preview.travelboastStory(stops, meta, state.highlight !== "none");
@@ -803,8 +805,9 @@ function wireSettings() {
   fitFrame();
 }
 
-/** the Story block: the trip's map style, swap, highlight, labels and effect, each a card that opens its picker */
-const TRIP_CHOICES = [["style", "mapStyle"], ["swap", "swap"], ["highlight", "highlight"], ["label", "labelStyle"], ["effect", "effect"]];
+/** the Story block: the trip's map style, stop marker, swap, highlight, labels and effect, each a card that opens
+ * its picker */
+const TRIP_CHOICES = [["style", "mapStyle"], ["marker", "stopMarker"], ["swap", "swap"], ["highlight", "highlight"], ["label", "labelStyle"], ["effect", "effect"]];
 function renderStoryChoices() {
   $("storyChoices").innerHTML = TRIP_CHOICES.map(([kind, field]) =>
     `<button type="button" class="story-choice" data-kind="${kind}"><span>${KINDS[kind][0]}</span><b>${esc(choiceName(kind, state[field]))}</b></button>`).join("");
@@ -982,7 +985,7 @@ function save() {
 }
 
 const FRESH = { template: "orbit", title: "", shape: "16:9", color: "#00a9df", duration: 0, camera: "fit", trailCamera: "orbit", trailDistance: 1,
-  swap: "smooth", highlight: "flag", labelStyle: "stamp", effect: "none", mapStyle: "Maps", storyCamera: "steady", stops: [] };
+  swap: "smooth", highlight: "flag", labelStyle: "stamp", effect: "none", mapStyle: "Maps", stopMarker: "disc", storyCamera: "steady", stops: [] };
 
 /** A template's own starting look over `FRESH`: a Story trip starts on TravelBoast's red route, flowers along
  * every leg and each country lit by its flag. A kept item's own settings stay its own. */
