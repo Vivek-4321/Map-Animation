@@ -16,6 +16,21 @@ export class WebEngine {
         wasm.__wbg_webengine_free(ptr, 0);
     }
     /**
+     * Font file `face` that came after the engine was made (`data/fonts/{face}.woff`'s bytes): the
+     * engine's text uses it from the next frame. False: not a face the engine names.
+     * @param {string} face
+     * @param {Uint8Array} bytes
+     * @returns {boolean}
+     */
+    add_font(face, bytes) {
+        const ptr0 = passStringToWasm0(face, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.webengine_add_font(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+        return ret !== 0;
+    }
+    /**
      * Tiles that arrived and wait to land.
      * @returns {number}
      */
@@ -723,6 +738,16 @@ export class WebEngine {
     take_tile_jobs() {
         const ret = wasm.webengine_take_tile_jobs(this.__wbg_ptr);
         return ret;
+    }
+    /**
+     * Tile fetches handed out for the look-ahead that the view now wants: moved up, the same download.
+     * @returns {Uint32Array}
+     */
+    take_tile_promotions() {
+        const ret = wasm.webengine_take_tile_promotions(this.__wbg_ptr);
+        var v1 = getArrayU32FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v1;
     }
     /**
      * Where the last frame drew each tagged title and caption: six numbers each (scene, item, then x, y,
@@ -3621,7 +3646,7 @@ function __wbg_get_imports() {
         },
         __wbindgen_generic_0000000000000003: function(arg0, arg1) {
             // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("GPUUncapturedErrorEvent")], shim_idx: 2476, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue______true__110);
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue______true__112);
             return ret;
         },
         __wbindgen_generic_0000000000000004: function(arg0) {
@@ -3689,8 +3714,8 @@ function wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bin
     wasm.wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue______true_(arg0, arg1, arg2);
 }
 
-function wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue______true__110(arg0, arg1, arg2) {
-    wasm.wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue______true__110(arg0, arg1, arg2);
+function wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue______true__112(arg0, arg1, arg2) {
+    wasm.wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue______true__112(arg0, arg1, arg2);
 }
 
 function wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue__core_ed718c3d60ebd546___result__Result_____wasm_bindgen_d5062a7ed11bff87___JsError___true_(arg0, arg1, arg2) {

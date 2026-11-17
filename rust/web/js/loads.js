@@ -14,15 +14,17 @@ export const sourceUrl = (src) => (/^(https?:|data:|blob:)/.test(src) ? src : ne
 const WORKERS = Math.min(4, Math.max(2, (self.navigator?.hardwareConcurrency || 4) - 2));
 /** downloads one worker has out at once; the rest wait their turn */
 const PER_WORKER = 6;
-/** while the view is moved by hand, at most this many tile downloads are out at once (MapLibre's
- * MAX_PARALLEL_IMAGE_REQUESTS_PER_FRAME while its map moves): the view goes by faster than most of them
- * would land, and the network and the workers' decoding are left to what still shows */
+/** while the view is moved by hand, at most this many of the view's tile downloads are out at once
+ * (MapLibre's MAX_PARALLEL_IMAGE_REQUESTS_PER_FRAME while its map moves): the view goes by faster than most
+ * of them would land, and the network and the workers' decoding are left to what still shows. The
+ * look-ahead's tiles start none meanwhile, and those out don't count against it. */
 const MOVING_TILES = 8;
 /** lost workers replaced, over the pool's life: past it the pool runs on with those it has */
 const RESTARTS = 8;
-/** downloads asked for only ahead of need (the look-ahead's tiles and files) out at once: one slot a worker
- * is always left to what the view needs now, so it never waits behind work for later */
-const AHEAD_OUT = WORKERS * (PER_WORKER - 1);
+/** downloads asked for only ahead of need (the look-ahead's tiles and files) out at once, a worker: one
+ * slot each is always left to what the view needs now, so it never waits behind work for later. Of the
+ * workers there are (`LoadPool::aheadRoom`): a pool down a worker keeps its reserve. */
+const AHEAD_PER_WORKER = PER_WORKER - 1;
 
 export class LoadPool {
   /** `spawn`: a new worker (tests give their own) */
@@ -56,6 +58,11 @@ export class LoadPool {
   release() {
     this.held = Math.max(0, this.held - 1);
     if (!this.held) this.pump();
+  }
+
+  /** How many look-ahead downloads may be out: all but one place on each worker there is. */
+  aheadRoom() {
+    return this.workers.length * AHEAD_PER_WORKER;
   }
 
   /** `job` in the queue by need: the view's own (tiles and files alike) before any asked for only ahead,
@@ -167,6 +174,7 @@ export class LoadPool {
     const [job] = this.queue.splice(i, 1);
     job.ahead = false;
     this.enqueue(job);
+    this.pump();
   }
 
   /** No job waits for `src` any more: dropped from the queue, or its download aborted (never answered). */
@@ -184,6 +192,20 @@ export class LoadPool {
     w.busy--;
     w.postMessage({ kind: "cancel", id: `f${id}` });
     this.pump();
+  }
+
+  /** A tile asked for ahead of need that the view now needs: still queued, it goes before the look-ahead;
+   * out, it no longer counts as the look-ahead's. The same download either way. */
+  promoteTile(id) {
+    const i = this.queue.findIndex((j) => j.kind === "tile" && j.id === id);
+    if (i >= 0) {
+      if (!this.queue[i].ahead) return;
+      const [job] = this.queue.splice(i, 1);
+      job.ahead = false;
+      this.enqueue(job);
+      return void this.pump();
+    }
+    if (this.aheadOut.delete(`tile:${id}`)) this.pump();
   }
 
   cancel(id) {
@@ -210,11 +232,15 @@ export class LoadPool {
       if (!this.workers.length) return this.failQueued("no load worker is left");
       const w = this.workers.reduce((a, b) => (b.busy < a.busy ? b : a));
       if (w.busy >= PER_WORKER) return;
-      // (while moving, the queue's first file goes ahead of tiles waiting for room; the look-ahead's
-      // wait while they hold all the room they may, `AHEAD_OUT`)
-      const tilesHeld = this.moving && this.owner.size >= MOVING_TILES;
-      const aheadHeld = this.aheadOut.size >= AHEAD_OUT;
-      const i = this.queue.findIndex((j) => !(tilesHeld && j.kind === "tile") && !(aheadHeld && j.ahead));
+      // (while moving, the view's tiles are held at `MOVING_TILES` of their own and the look-ahead's
+      // tiles start none, so the queue's first file goes ahead of them; the look-ahead's jobs wait while
+      // they hold all the room they may, `aheadRoom`)
+      let aheadTiles = 0;
+      for (const k of this.aheadOut) if (k.startsWith("tile:")) aheadTiles++;
+      const viewTilesHeld = this.moving && this.owner.size - aheadTiles >= MOVING_TILES;
+      const aheadHeld = this.aheadOut.size >= this.aheadRoom();
+      const i = this.queue.findIndex((j) =>
+        !(aheadHeld && j.ahead) && !(j.kind === "tile" && this.moving && (j.ahead || viewTilesHeld)));
       if (i < 0) return;
       const [job] = this.queue.splice(i, 1);
       if (job.ahead) this.aheadOut.add(`${job.kind}:${job.id}`);

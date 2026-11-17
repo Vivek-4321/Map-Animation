@@ -14,6 +14,10 @@ import { Muxer, ArrayBufferTarget, StreamTarget } from "../vendor/mp4-muxer.mjs"
 /** the preview's beat: a frame at most this often (ms), whatever asked for it (playing, a gesture, a
  * landing, a change to the story): the film's own 30 a second */
 const FRAME_GAP = 1000 / 30;
+/** While the view or the playhead is moved by hand, frames come as often as the display gives them, down
+ * to this gap (ms), when the last second's frames were drawn well within it (`beatGap`); the film's own beat
+ * otherwise, and on a device that can't keep up. */
+const GESTURE_GAP = 1000 / 60;
 /** a frame still waiting for loads is drawn again this often (ms): PreviewDriver's buffering cadence */
 const BUFFER_GAP = 100;
 /** while playing, a frame with more map tiles than this still to come is behind the film: the rest of
@@ -95,6 +99,7 @@ const st = {
   caughtUpSince: 0, // when its draft's map last caught up (0: it hasn't)
   last: 0,
   lastDraw: 0,
+  nextBeat: 0, // when the next frame is due on the beat (`step`)
   landed: false, // something landed (or an answer came that lands in the frame) since the last draw
   settle: 0,
   transitioning: false, // the last frame drawn was still changing by itself (the engine says)
@@ -374,6 +379,12 @@ function failed(err) {
 
 /** the faces the editor's films draw with: Inter, and the Story template's place labels (`label_art`) */
 const EDITOR_FACES = ["Inter", "Montserrat", "Caveat", "Cinzel", "LuckiestGuy"];
+/** What the first map waits for before the engine starts: the world's borders and country codes, and
+ * Inter (the editor's own text, the default map's names). The other faces (a label style's, a theme's)
+ * are fetched beside them and waited for at most `STARTUP_FONT_GRACE_MS` more; one that comes later is
+ * given to the running engine (`add_font`), never holding the first map back. */
+const ESSENTIAL_FACES = ["Inter"];
+const STARTUP_FONT_GRACE_MS = 1500;
 
 async function start({ canvas, w, h, template, webgl, lowMemory, remotelog, noMapWorker }) {
   // TEMPORARY (Safari black-map diagnosis)
@@ -386,19 +397,34 @@ async function start({ canvas, w, h, template, webgl, lowMemory, remotelog, noMa
   await init({ module_or_path: module });
   post({ kind: "status-note", note: "Fetching the map's fonts and borders" });
   const files = new WebFiles();
-  await Promise.all(
-    // This page fixes the theme to Maps: its cards and distances use Inter, a Story's place labels its
-    // label faces (EDITOR_FACES). Other editor templates still get the full catalogue.
-    startup_files().filter((src) => template !== "multdev" || !src.startsWith("data/fonts/") || EDITOR_FACES.some((f) => src.startsWith(`data/fonts/${f}-`))).map(async (src) => {
-      try {
-        // (the deadline holds the body too: a fetch's signal aborts its body's reading)
-        const r = await fetch(sourceUrl(src), { signal: AbortSignal.timeout(STARTUP_DEADLINE_MS) });
-        if (r.ok) files.put(src, new Uint8Array(await r.arrayBuffer()));
-      } catch {
-        /* the engine does without it */
-      }
-    }),
-  );
+  // This page fixes the theme to Maps: its cards and distances use Inter, a Story's place labels its
+  // label faces (EDITOR_FACES). Other editor templates still get the full catalogue.
+  const wanted = startup_files().filter((src) => template !== "multdev" || !src.startsWith("data/fonts/") || EDITOR_FACES.some((f) => src.startsWith(`data/fonts/${f}-`)));
+  const face = (src) => src.match(/^data\/fonts\/(.+)\.woff$/)?.[1];
+  const essential = (src) => !face(src) || ESSENTIAL_FACES.some((f) => face(src).startsWith(`${f}-`));
+  // each fetch's bytes, or null (the engine does without it); the deadline holds the body too
+  const fetched = new Map(wanted.map((src) => [src, (async () => {
+    try {
+      const r = await fetch(sourceUrl(src), { signal: AbortSignal.timeout(STARTUP_DEADLINE_MS) });
+      return r.ok ? new Uint8Array(await r.arrayBuffer()) : null;
+    } catch {
+      return null;
+    }
+  })()]));
+  const late = new Set();
+  const given = new Set();
+  const settle = async (src) => {
+    const bytes = await fetched.get(src);
+    if (bytes && !late.has(src)) {
+      files.put(src, bytes);
+      given.add(src);
+    }
+  };
+  await Promise.all(wanted.filter(essential).map(settle));
+  const rest = wanted.filter((src) => !essential(src));
+  await Promise.race([Promise.all(rest.map(settle)), new Promise((r) => setTimeout(r, STARTUP_FONT_GRACE_MS))]);
+  // the faces still on their way go to the engine once it runs (`add_font`)
+  for (const src of rest) if (!given.has(src)) late.add(src);
   post({ kind: "status-note", note: "Starting the GPU" });
   canvas.width = w;
   canvas.height = h;
@@ -428,6 +454,18 @@ async function start({ canvas, w, h, template, webgl, lowMemory, remotelog, noMa
   st.last = performance.now();
   wake();
   post({ kind: "ready" });
+  // a face that came after the engine started: its text uses it from the next frame
+  for (const src of late) {
+    fetched.get(src).then((bytes) => {
+      if (!bytes || st.dead || !st.engine) return;
+      try {
+        if (st.engine.add_font(face(src), bytes)) {
+          st.dirty = true;
+          wake();
+        }
+      } catch {}
+    });
+  }
 }
 
 /** The map worker (map-worker.js): paints the preview's map on a GPU device of its own, so this thread never
@@ -741,7 +779,7 @@ function landCpu(now) {
   const e = st.engine;
   // the next frame: the beat after the last one drawn when frames are coming, else a beat from now
   const coming = st.playing || st.dirty || st.moving || st.scrubbing || st.settle > 0 || st.transitioning;
-  const end = (coming ? st.lastDraw : now) + FRAME_GAP - CPU_LAND_MARGIN_MS;
+  const end = (coming ? st.nextBeat : now + beatGap(now)) - CPU_LAND_MARGIN_MS;
   const t0 = performance.now();
   let n = 0;
   const seen = [...st.cpuSeen].sort((a, b) => a - b);
@@ -910,8 +948,9 @@ function step(now) {
     if (loads < st.lastPending) st.landed = true;
     st.lastPending = loads;
     const since = now - st.lastDraw;
+    const gap = beatGap(now);
     // (2 ms of slack: a display's frames come a little early or late, and 60 Hz's every other one is 33.3)
-    const onBeat = since >= FRAME_GAP - 2;
+    const onBeat = onTheBeat(now);
     let due =
       (onBeat && (st.dirty || st.playing || st.landed || st.settle > 0 || st.transitioning)) ||
       (pending && since >= BUFFER_GAP);
@@ -931,6 +970,7 @@ function step(now) {
       st.dirty = false;
       st.landed = false;
       st.lastDraw = now;
+      beatDrawn(now, onBeat, gap);
       draw(now);
       // the time left before the next frame is the most there is for what came meanwhile
       if (st.cpuWaiting.length) landCpu(now);
@@ -987,6 +1027,7 @@ function handOutBatch(e) {
   for (const id of e.take_tile_cancels()) st.pool.cancel(id);
   const jobs = e.take_tile_jobs();
   for (let i = 0; i < jobs.length; i += 3) st.pool.tile(jobs[i], jobs[i + 1], jobs[i + 2]);
+  for (const id of e.take_tile_promotions()) st.pool.promoteTile(id);
   for (const src of e.take_file_cancels()) st.pool.cancelFile(src);
   const files = e.take_file_requests();
   for (let i = 0; i < files.length; i += 2) st.pool.file(files[i], files[i + 1]);
@@ -997,11 +1038,33 @@ function handOutBatch(e) {
   for (let i = 0; i < cpu.length; i += 3) st.pool.cpu(cpu[i], cpu[i + 1], cpu[i + 2]);
 }
 
-/** Whether the last second's frames were drawn in time for the film's beat (three in four of them within
- * `FRAME_GAP`): a play draft only ends when the full frame can keep up too. */
-function framesOnTime(now) {
+/** Whether the last second's frames were drawn within `gap` (ms; three in four of them): a play draft only
+ * ends when the full frame can keep up with the film's beat too. */
+function framesOnTime(now, gap = FRAME_GAP) {
   const recent = st.costs.filter(([at]) => now - at < 1000).map(([, c]) => c).sort((a, b) => a - b);
-  return recent.length > 0 && recent[Math.floor(recent.length * 0.75)] < FRAME_GAP;
+  return recent.length > 0 && recent[Math.floor(recent.length * 0.75)] < gap;
+}
+
+/** Whether a frame is due on the beat at `now`. The beat runs on from where it was, not from the last
+ * draw: a display whose refresh doesn't divide it (75 Hz: two refreshes short of a beat, three past)
+ * still gets the film's 30 a second. (2 ms of slack: a display's frames come a little early or late.) */
+function onTheBeat(now) {
+  return now >= st.nextBeat - 2;
+}
+
+/** A frame was drawn at `now` (`onBeat`: for the beat, `gap` ms long): the next beat is one on from this
+ * one's, a beat from now after a stall (never a burst to catch up), and at least half a beat away after a
+ * draw between beats. */
+function beatDrawn(now, onBeat, gap) {
+  st.nextBeat = onBeat ? st.nextBeat + gap : Math.max(st.nextBeat, now + gap / 2);
+  if (st.nextBeat <= now) st.nextBeat = now + gap;
+}
+
+/** The beat now (ms): a gesture's (`GESTURE_GAP`) while the view or the playhead is moved by hand and the
+ * frames come well within it, else the film's. */
+function beatGap(now) {
+  const byHand = st.moving || st.mapMoving || st.scrubbing;
+  return byHand && framesOnTime(now, GESTURE_GAP * 0.8) ? GESTURE_GAP : FRAME_GAP;
 }
 
 function frameStats(now) {

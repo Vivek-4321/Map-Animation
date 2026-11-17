@@ -43,8 +43,16 @@ const FILE_MAX_BYTES = 256 << 20;
  * is skipped (the cache is a copy, fetched again when missing). */
 const HELD_MAX_BYTES = 192 << 20;
 
+/** A raster tile's chain compressed for the store, kept in the cache beside its download (one key a tile,
+ * store format and this encoder): a tile seen before, after a reload, is answered without its download,
+ * decode or compression. Bumped when `tile_encode`'s output changes, so old chains are never read. */
+const LEVELS_SCHEMA = 1;
+const levelsKey = (url, format) => `${url}${url.includes("?") ? "&" : "?"}map-levels=${format}.${LEVELS_SCHEMA}`;
+
 let ready = null;
 let cache = null;
+/** raster tiles being fetched again in the background (`refreshTile`), by URL: one refresh each */
+const refreshing = new Set();
 let stores = 0;
 /** bytes held now: bodies being read and assembled, and cache writes not yet settled */
 let held = 0;
@@ -160,10 +168,14 @@ async function readBody(r, max) {
  * the answer; a stale one is the answer when the refresh fails, however it fails (no answer, an error, its
  * body dropped or timed out as it came), as long as the job is still `wanted` (a cancelled one does no
  * more). Throws on no response with no stale copy. Every body it doesn't read is cancelled. */
-async function download(url, signal, keep, max, wanted = () => true) {
+async function download(url, signal, keep, max, wanted = () => true, staleOk = false) {
   const copy = keep && cache ? await cache.match(url).catch(() => null) : null;
-  if (copy && Date.now() - (Number(copy.headers.get(STORED)) || 0) <= source_max_age_s(url) * 1000) {
+  if (copy && isFresh(copy, url)) {
     return { status: 200, bytes: await readBody(copy, max) };
+  }
+  // a map picture past its age is shown at once (`staleOk`): the caller has it fetched again behind it
+  if (copy && staleOk) {
+    return { status: 200, bytes: await readBody(copy, max), stale: true };
   }
   // the refresh failed: the old bytes (as map-net's cache keeps them), else `failure`'s answer
   const failed = async (failure) => {
@@ -193,6 +205,32 @@ async function download(url, signal, keep, max, wanted = () => true) {
   }
   if (keep && cache) store(url, bytes, r.headers.get("content-type"));
   return { status: r.status, bytes };
+}
+
+/** Whether cached `r` for `url` is within the age the shells' one rule gives it (`source_max_age_s`). */
+const isFresh = (r, url) => Date.now() - (Number(r.headers.get(STORED)) || 0) <= source_max_age_s(url) * 1000;
+
+/** Raster tile `url` fetched again in the background, its copy (and with `format`, its compressed chain)
+ * replaced in the cache for the next time it is asked for; what is on show is not touched. One refresh a
+ * tile at once; one the server asks to wait for, or that fails, is left for the next. */
+async function refreshTile(url, format) {
+  if (refreshing.has(url) || !cache) return;
+  refreshing.add(url);
+  try {
+    const r = await fetch(url, { mode: "cors", signal: AbortSignal.timeout(TILE_DEADLINE_MS) });
+    if (!r.ok) return void r.body?.cancel().catch(() => {});
+    const bytes = await readBody(r, TILE_MAX_BYTES);
+    store(url, bytes, r.headers.get("content-type"));
+    if (format) {
+      const rgba = decode_tile(bytes);
+      const lv = rgba ? tile_encode(url, rgba, format) : null;
+      if (lv) store(levelsKey(url, format), lv, "application/octet-stream");
+    }
+  } catch {
+    /* the next ask tries again */
+  } finally {
+    refreshing.delete(url);
+  }
 }
 
 /** `bytes` kept for `url` (copied as the Response is made: the caller may transfer them at once). The copy
@@ -265,23 +303,36 @@ async function guarded(key, deadline, job, answer) {
 /** A download job: `url` fetched under `key` (what a cancel names) within `deadline` and `max` bytes, and
  * `use(result)` called only while the job is still wanted; a failure, `use`'s own included, goes to
  * `answer` (a cancelled job hears nothing). The one lifecycle of every download this worker makes. */
-function downloadJob(key, deadline, url, max, use, answer) {
+function downloadJob(key, deadline, url, max, use, answer, staleOk = false) {
   return guarded(
     key,
     deadline,
     async (signal, wanted) => {
-      const r = await download(url, signal, remote(url), max, wanted);
+      const r = await download(url, signal, remote(url), max, wanted, staleOk);
       if (wanted()) use(r);
     },
     answer,
   );
 }
 
-function tile({ id, url, format }) {
+async function tile({ id, url, format }) {
   const answer = (err) => {
     if (err instanceof Busy) return post({ kind: "tile", id, throttled: 1 });
     post({ kind: "tile", id, failed: String(err?.message ?? err) });
   };
+  // its chain compressed before (this store's format, this encoder): no download, decode or compression;
+  // past its age, shown at once and made again behind it for next time
+  const keep = format && remote(url) && cache;
+  if (keep) {
+    const kept = await cache.match(levelsKey(url, format)).catch(() => null);
+    if (kept) {
+      if (!isFresh(kept, url)) refreshTile(url, format);
+      const lv = new Uint8Array(await kept.arrayBuffer().catch(() => new ArrayBuffer(0)));
+      // (an empty chain: the source's placeholder, no imagery there)
+      if (!lv.length) return post({ kind: "tile", id, noData: true });
+      return post({ kind: "tile", id, levels: lv }, [lv.buffer]);
+    }
+  }
   return downloadJob(
     id,
     TILE_DEADLINE_MS,
@@ -296,11 +347,17 @@ function tile({ id, url, format }) {
       // compressed for the store: the placeholder test and the levels from one mip chain (an empty answer
       // is the placeholder); for a store of plain pixels, the placeholder test alone
       const lv = format ? tile_encode(url, rgba, format) : null;
+      // (kept for next time: copied as it is stored, before it is handed over; an old copy's chain isn't,
+      // the refresh behind it makes both again)
+      if (r.stale) refreshTile(url, format);
+      else if (keep && lv) store(levelsKey(url, format), lv, "application/octet-stream");
       if (format ? lv?.length === 0 : tile_is_no_data(url, rgba)) return post({ kind: "tile", id, noData: true });
       if (lv) return post({ kind: "tile", id, levels: lv }, [lv.buffer]);
       post({ kind: "tile", id, rgba }, [rgba.buffer]);
     },
     answer,
+    // (a map picture: an old copy shows while a new one comes)
+    true,
   );
 }
 
