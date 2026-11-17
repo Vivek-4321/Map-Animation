@@ -20,6 +20,9 @@ const PER_WORKER = 6;
 const MOVING_TILES = 8;
 /** lost workers replaced, over the pool's life: past it the pool runs on with those it has */
 const RESTARTS = 8;
+/** downloads asked for only ahead of need (the look-ahead's tiles and files) out at once: one slot a worker
+ * is always left to what the view needs now, so it never waits behind work for later */
+const AHEAD_OUT = WORKERS * (PER_WORKER - 1);
 
 export class LoadPool {
   /** `spawn`: a new worker (tests give their own) */
@@ -40,6 +43,27 @@ export class LoadPool {
     this.nextFile = 1;
     this.moving = false;
     this.buildOut = new Set(); // "kind:id" of the builds out with the build worker (relief areas)
+    this.aheadOut = new Set(); // "kind:id" of the downloads out that only the look-ahead wants
+    this.held = 0; // `hold`s not yet released: the queue is filled, not pumped
+  }
+
+  /** Jobs about to be handed over in a batch (cancels, new ones, promotions): none goes out until
+   * `release`, then the queue is pumped once, in its order. */
+  hold() {
+    this.held++;
+  }
+
+  release() {
+    this.held = Math.max(0, this.held - 1);
+    if (!this.held) this.pump();
+  }
+
+  /** `job` in the queue by need: the view's own (tiles and files alike) before any asked for only ahead,
+   * in the order they came. */
+  enqueue(job) {
+    const behind = job.ahead ? -1 : this.queue.findIndex((j) => j.ahead);
+    if (behind < 0) this.queue.push(job);
+    else this.queue.splice(behind, 0, job);
   }
 
   start(onMessage = (w, m) => this.answered(w, m)) {
@@ -52,8 +76,9 @@ export class LoadPool {
     return w;
   }
 
-  tile(id, url) {
-    this.queue.push({ kind: "tile", id, url, format: this.format });
+  /** A map tile's download. `ahead`: only the look-ahead wants it (it waits behind the view's own). */
+  tile(id, url, ahead = false) {
+    this.enqueue({ kind: "tile", id, url, format: this.format, ahead });
     this.pump();
   }
 
@@ -82,21 +107,27 @@ export class LoadPool {
     this.build("detail", id, bytes);
   }
 
-  /** Vector preparation and image decodes never queue behind relief builds or tile downloads.
-   * Rust admits at most two jobs; a dedicated worker runs them in that bounded order. */
-  cpu(id, bytes) {
-    if (!this.cpuWorker) {
-      if (this.cpuStarts > RESTARTS) return void this.onAnswer({ kind: "cpu", id, bytes: null });
-      this.cpuStarts = (this.cpuStarts || 0) + 1;
-      this.cpuOut = new Set();
-      this.cpuWorker = this.start((w, m) => {
+  /** Vector preparation and image decodes never queue behind relief builds or tile downloads, and a
+   * model's preparation (its parse, textures and levels of detail, the longest job) never queues
+   * before them: models go to a worker of their own (`model`). Rust admits at most two jobs on each;
+   * each worker runs its own in that bounded order. */
+  cpu(id, bytes, model = false) {
+    const lane = model ? "model" : "fast";
+    this.cpuLanes ??= {};
+    let c = this.cpuLanes[lane];
+    if (!c?.worker) {
+      c = this.cpuLanes[lane] ??= { starts: 0 };
+      if (c.starts > RESTARTS) return void this.onAnswer({ kind: "cpu", id, bytes: null });
+      c.starts++;
+      c.out = new Set();
+      c.worker = this.start((w, m) => {
         if (m.kind === "init-failed") return this.lost(w, m.error);
-        if (w !== this.cpuWorker || m.kind !== "cpu" || !this.cpuOut.delete(m.id)) return;
+        if (w !== c.worker || m.kind !== "cpu" || !c.out.delete(m.id)) return;
         this.onAnswer(m);
       });
     }
-    this.cpuOut.add(id);
-    this.cpuWorker.postMessage({ kind: "cpu", id, bytes }, [bytes.buffer]);
+    c.out.add(id);
+    c.worker.postMessage({ kind: "cpu", id, bytes }, [bytes.buffer]);
   }
 
   /** A long build of `kind` ("detail"): on a worker of its own (the build worker), so one that
@@ -124,14 +155,8 @@ export class LoadPool {
     if (this.fileIds.has(src)) this.cancelFile(src);
     const id = this.nextFile++;
     this.fileIds.set(src, id);
-    this.enqueueFile({ kind: "file", id, src, url: sourceUrl(src), ahead });
+    this.enqueue({ kind: "file", id, src, url: sourceUrl(src), ahead });
     this.pump();
-  }
-
-  enqueueFile(job) {
-    const behind = job.ahead ? -1 : this.queue.findIndex((j) => j.kind === "file" && j.ahead);
-    if (behind < 0) this.queue.push(job);
-    else this.queue.splice(behind, 0, job);
   }
 
   /** A source asked for ahead of need that the view now needs: still queued, it goes before the look-ahead. */
@@ -141,7 +166,7 @@ export class LoadPool {
     if (i < 0 || !this.queue[i].ahead) return;
     const [job] = this.queue.splice(i, 1);
     job.ahead = false;
-    this.enqueueFile(job);
+    this.enqueue(job);
   }
 
   /** No job waits for `src` any more: dropped from the queue, or its download aborted (never answered). */
@@ -155,6 +180,7 @@ export class LoadPool {
     if (!w) return;
     this.fileOwner.delete(id);
     this.fileSrc.delete(id);
+    this.aheadOut.delete(`file:${id}`);
     w.busy--;
     w.postMessage({ kind: "cancel", id: `f${id}` });
     this.pump();
@@ -166,6 +192,7 @@ export class LoadPool {
     const w = this.owner.get(id);
     if (!w) return;
     this.owner.delete(id);
+    this.aheadOut.delete(`tile:${id}`);
     w.busy--;
     w.postMessage({ kind: "cancel", id });
     this.pump();
@@ -178,15 +205,19 @@ export class LoadPool {
   }
 
   pump() {
+    if (this.held) return;
     while (this.queue.length) {
       if (!this.workers.length) return this.failQueued("no load worker is left");
       const w = this.workers.reduce((a, b) => (b.busy < a.busy ? b : a));
       if (w.busy >= PER_WORKER) return;
-      // (while moving, the queue's first file goes ahead of tiles waiting for room)
-      const held = this.moving && this.owner.size >= MOVING_TILES;
-      const i = held ? this.queue.findIndex((j) => j.kind !== "tile") : 0;
+      // (while moving, the queue's first file goes ahead of tiles waiting for room; the look-ahead's
+      // wait while they hold all the room they may, `AHEAD_OUT`)
+      const tilesHeld = this.moving && this.owner.size >= MOVING_TILES;
+      const aheadHeld = this.aheadOut.size >= AHEAD_OUT;
+      const i = this.queue.findIndex((j) => !(tilesHeld && j.kind === "tile") && !(aheadHeld && j.ahead));
       if (i < 0) return;
       const [job] = this.queue.splice(i, 1);
+      if (job.ahead) this.aheadOut.add(`${job.kind}:${job.id}`);
       w.busy++;
       if (job.kind === "tile") this.owner.set(job.id, w);
       if (job.kind === "levels") this.levelsOwner.set(job.id, w);
@@ -204,6 +235,7 @@ export class LoadPool {
     if (m.kind === "tile") {
       if (this.owner.get(m.id) !== w) return; // cancelled meanwhile
       this.owner.delete(m.id);
+      this.aheadOut.delete(`tile:${m.id}`);
     }
     if (m.kind === "levels") {
       if (this.levelsOwner.get(m.id) !== w) return;
@@ -213,6 +245,7 @@ export class LoadPool {
       if (this.fileOwner.get(m.id) !== w) return; // cancelled meanwhile
       this.fileOwner.delete(m.id);
       this.fileSrc.delete(m.id);
+      this.aheadOut.delete(`file:${m.id}`);
       if (this.fileIds.get(m.src) === m.id) this.fileIds.delete(m.src);
     }
     w.busy--;
@@ -231,10 +264,11 @@ export class LoadPool {
       /* gone already */
     }
     const failed = `the load worker stopped (${why})`;
-    if (w === this.cpuWorker) {
-      this.cpuWorker = null;
-      const out = [...this.cpuOut];
-      this.cpuOut.clear();
+    const lane = Object.values(this.cpuLanes ?? {}).find((c) => c.worker === w);
+    if (lane) {
+      lane.worker = null;
+      const out = [...lane.out];
+      lane.out.clear();
       for (const id of out) this.onAnswer({ kind: "cpu", id, bytes: null });
       return;
     }
@@ -253,6 +287,7 @@ export class LoadPool {
     for (const [id, owner] of this.owner) {
       if (owner !== w) continue;
       this.owner.delete(id);
+      this.aheadOut.delete(`tile:${id}`);
       answers.push({ kind: "tile", id, failed });
     }
     for (const [id, owner] of this.levelsOwner) {
@@ -265,6 +300,7 @@ export class LoadPool {
       const src = this.fileSrc.get(id);
       this.fileOwner.delete(id);
       this.fileSrc.delete(id);
+      this.aheadOut.delete(`file:${id}`);
       if (this.fileIds.get(src) === id) this.fileIds.delete(src);
       answers.push({ kind: "file", id, src, failed, status: 0 });
     }

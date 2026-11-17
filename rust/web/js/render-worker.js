@@ -21,6 +21,13 @@ const BUFFER_GAP = 100;
 const PLAY_BEHIND_TILES = 16;
 /** ...once it has been behind this long (ms): tiles coming from the cache catch up within it */
 const PLAY_BEHIND_MS = 1000;
+/** A play-through's draft ends while it plays once its map has caught up: this few tiles still to come... */
+const PLAY_CAUGHT_UP_TILES = 2;
+/** ...for this long (ms), its frames drawn in time meanwhile (`framesOnTime`)... */
+const PLAY_CAUGHT_UP_MS = 1500;
+/** ...and the draft has held at least this long (ms): a backlog that clears at once never resizes the frame
+ * back and forth. Back at full size, falling behind again takes `PLAY_BEHIND_MS` of it. */
+const PLAY_DRAFT_HOLD_MS = 2500;
 /** A CPU job's answer (a street map tile made ready on a worker, megabytes) takes 10-30 ms to land here:
  * landed as it came, two at once dropped a frame. So answers wait (`landCpu`) and land between frames,
  * each only if it can be done, by its size (`CPU_LAND_MS_PER_MB`, measured in Chrome on an M1), before the
@@ -32,6 +39,9 @@ const CPU_LAND_SEEN = 24;
 const CPU_LAND_SEEN_MB = 0.25;
 const CPU_LAND_MARGIN_MS = 4;
 const CPU_LAND_WAIT_MS = 250;
+/** CPU answers waiting to land up to this many bytes free the worker's slot for the next job; past it, an
+ * answer keeps its slot until it lands, so the bytes waiting stay bounded. */
+const CPU_WAITING_BYTES = 64 << 20;
 /** frames drawn after a landing (PreviewDriver's settle frames) */
 const SETTLE_FRAMES = 2;
 /** a gesture's end waits this long before the view is drawn still (PreviewDriver's SHARPEN_DELAY_MS): a
@@ -81,6 +91,8 @@ const st = {
   drafting: false,
   playDraft: false, // this play-through fell behind its loads: drawn as drafts until it stops
   behindSince: 0, // when the playing frames last fell behind (0: they aren't)
+  draftSince: 0, // when this play-through's draft began
+  caughtUpSince: 0, // when its draft's map last caught up (0: it hasn't)
   last: 0,
   lastDraw: 0,
   landed: false, // something landed (or an answer came that lands in the frame) since the last draw
@@ -239,6 +251,7 @@ self.onmessage = async (e) => {
       case "map-worker":
         // (the preview's map painted on the map worker, or here: for comparing the two)
         st.mapWorkerOn = !!m.on;
+        st.mapPaintOut = 0; // (switched, the engine forgets any paint out)
         st.engine?.set_remote_print(st.mapWorkerOn && !!st.mapWorker);
         st.dirty = true;
         return;
@@ -421,24 +434,65 @@ async function start({ canvas, w, h, template, webgl, lowMemory, remotelog, noMa
  * paints it (map-engine's `printed_map::remote`). This thread sends it the map's tiles as they land and its
  * paints after each tick (`flushMapWorker`); each picture comes back as an ImageBitmap, copied into the map's
  * texture on the GPU (`mapPicture`). WebGPU only: on WebGL2 the map is painted here, as before it is ready. */
+/** A paint out at the map worker this long (ms) with no picture back: the worker is taken for lost
+ * (`dropMapWorker`). Its first paints build its pipelines, a few seconds on a slow device: well inside. */
+const MAP_WORKER_SILENT_MS = 10000;
+/** A lost map worker is started again this many times a session; after that the map is painted here. */
+const MAP_WORKER_RESTARTS = 2;
+
+/** The map worker is lost (it stopped, a message could not be read, or it went silent with a paint out):
+ * it goes, the map is painted on this thread from the next frame (the engine forgets the paint it was
+ * owed), and a new one is started, `MAP_WORKER_RESTARTS` times at most. Its late pictures are dropped. */
+function dropMapWorker(why) {
+  const lost = st.mapWorker;
+  if (!lost && !st.mapWorkerStarting) return;
+  console.warn(`map worker lost (${why}): the map is painted here meanwhile`);
+  if (st.remotelog) remoteLog("render", "[map worker] lost:", why);
+  st.mapWorker = null;
+  st.mapPaintOut = 0;
+  try { (lost ?? st.mapWorkerStarting).worker.terminate(); } catch {}
+  st.mapWorkerStarting = null;
+  st.engine?.set_remote_print(false);
+  st.dirty = true;
+  wake();
+  if ((st.mapWorkerRestarts ?? 0) < MAP_WORKER_RESTARTS && st.wasmModule) {
+    st.mapWorkerRestarts = (st.mapWorkerRestarts ?? 0) + 1;
+    startMapWorker(st.wasmModule);
+  }
+}
+
 function startMapWorker(module) {
   if (typeof Worker !== "function" || typeof OffscreenCanvas !== "function") return void (st.remotelog && remoteLog("render", "[map worker] not started: no Worker or OffscreenCanvas"));
   if (!st.engine.diagnostics().split("\n")[0].includes("WebGpu")) return void (st.remotelog && remoteLog("render", "[map worker] not started: the engine is not on WebGPU"));
+  st.wasmModule = module;
   const ch = new MessageChannel();
   const w = new Worker(new URL("./map-worker.js", import.meta.url), { type: "module" });
+  const mine = { worker: w, port: ch.port1 };
+  st.mapWorkerStarting = mine;
+  w.onerror = (e) => {
+    e.preventDefault?.();
+    if (st.mapWorker === mine || st.mapWorkerStarting === mine) dropMapWorker(`it stopped: ${e.message || "an error"}`);
+  };
+  w.onmessageerror = () => {
+    if (st.mapWorker === mine || st.mapWorkerStarting === mine) dropMapWorker("a message from it could not be read");
+  };
+  ch.port1.onmessageerror = w.onmessageerror;
   const rows = Array.from(st.engine.tile_worker_fonts());
   const fonts = rows.map((r) => r[1]);
   w.postMessage({ kind: "init", module, names: rows.map((r) => r[0]), fonts, port: ch.port2, remotelog: st.remotelog }, [ch.port2, ...fonts.map((f) => f.buffer)]);
   w.onmessage = (e) => {
     if (st.remotelog) remoteLog("render", "[map worker] says", e.data.kind, e.data.error ?? "", "| painting there:", st.mapWorkerOn);
     if (e.data.kind === "ready") {
-      st.mapWorker = { worker: w, port: ch.port1 };
+      if (st.mapWorkerStarting !== mine) return;
+      st.mapWorkerStarting = null;
+      st.mapWorker = mine;
       if (st.mapWorkerOn) st.engine.set_remote_print(true);
       st.dirty = true;
       wake();
     } else if (e.data.kind === "failed") console.warn(`map worker: ${e.data.error}`);
   };
-  ch.port1.onmessage = (e) => mapPicture(e.data);
+  // (a picture from a worker since dropped is no one's: let go)
+  ch.port1.onmessage = (e) => (st.mapWorker === mine ? mapPicture(e.data) : e.data?.bitmap?.close());
 }
 
 /** The preview's size as drawn: the page's, times the governor's scale (`applyScale`). */
@@ -479,15 +533,19 @@ function applyScale(now) {
 /** What the engine has for the map worker (its tiles, its paints), to it, the bytes' buffers transferred. */
 function flushMapWorker() {
   if (!st.mapWorker || st.dead || !st.engine) return;
+  // a paint out too long with no picture back: the worker is lost
+  if (st.mapPaintOut && performance.now() - st.mapPaintOut > MAP_WORKER_SILENT_MS) return dropMapWorker("no picture back");
   const rows = st.engine.take_remote_print_out();
   if (!rows.length) return;
   const transfer = [];
   for (const r of rows) if (r[2]) transfer.push(r[2].buffer);
+  if (!st.mapPaintOut && rows.some((r) => r[0] === "paint")) st.mapPaintOut = performance.now();
   st.mapWorker.port.postMessage({ rows }, transfer);
 }
 
 /** A picture from the map worker (or word that it painted none): in the map's texture for the next frame. */
 function mapPicture({ painted, meshes, bitmap, ms }) {
+  st.mapPaintOut = 0;
   if (st.dead || !st.engine) return void bitmap?.close();
   if (st.remotelog) {
     st.mapPictures = (st.mapPictures ?? 0) + 1;
@@ -611,8 +669,13 @@ function answerNow(m) {
   const e = st.engine;
   try {
     if (m.kind === "cpu") {
-      // (landed between frames, `landCpu`)
-      if (m.bytes) return void st.cpuWaiting.push({ m, at: performance.now() });
+      // (landed between frames, `landCpu`; the worker's slot freed meanwhile while the answers waiting
+      // hold under `CPU_WAITING_BYTES`, else once this one lands)
+      if (m.bytes) {
+        const waiting = st.cpuWaiting.reduce((s, w) => s + w.m.bytes.byteLength, 0);
+        if (waiting + m.bytes.byteLength <= CPU_WAITING_BYTES) e.cpu_finished(m.id);
+        return void st.cpuWaiting.push({ m, at: performance.now() });
+      }
       e.cpu_failed(m.id);
     } else if (m.kind === "detail") {
       if (m.bytes) e.detail_done(m.id, m.bytes);
@@ -670,8 +733,10 @@ function active() {
     st.cpuWaiting.length > 0);
 }
 
-/** The CPU jobs' answers that fit before the next frame is due, oldest first (`CPU_LAND_MS_PER_MB`); one
- * kept waiting too long lands anyway. Each shows in the next frame. `now`: this tick's frame time. */
+/** The CPU jobs' answers that fit before the next frame is due (`CPU_LAND_MS_PER_MB`), oldest first, each
+ * that fits whatever its place: a big answer that doesn't fit yet holds back none smaller behind it (a
+ * flag's, a tile's). One kept waiting `CPU_LAND_WAIT_MS` lands anyway, before any other. Each shows in the
+ * next frame. `now`: this tick's frame time. */
 function landCpu(now) {
   const e = st.engine;
   // the next frame: the beat after the last one drawn when frames are coming, else a beat from now
@@ -682,12 +747,16 @@ function landCpu(now) {
   const seen = [...st.cpuSeen].sort((a, b) => a - b);
   const msPerMb = Math.max(CPU_LAND_MS_PER_MB, seen.length ? seen[Math.floor(seen.length * 0.75)] : 0);
   while (st.cpuWaiting.length) {
-    const { m, at } = st.cpuWaiting[0];
     const t = performance.now();
+    const cost = (w) => (w.m.bytes.byteLength / 1048576) * msPerMb;
+    // (the oldest overdue one first, else the oldest that fits)
+    let i = st.cpuWaiting.findIndex((w) => t - w.at >= CPU_LAND_WAIT_MS);
+    const overdue = i >= 0;
+    if (!overdue) i = st.cpuWaiting.findIndex((w) => t + cost(w) <= end);
+    if (i < 0) break;
+    const [{ m }] = st.cpuWaiting.splice(i, 1);
     const mb = m.bytes.byteLength / 1048576;
-    const fits = t + mb * msPerMb <= end;
-    if (!fits && t - at < CPU_LAND_WAIT_MS) break;
-    st.cpuWaiting.shift();
+    const fits = !overdue;
     try {
       e.cpu_done(m.id, m.bytes);
     } catch (err) {
@@ -804,12 +873,27 @@ function step(now) {
     if (paceLook()) st.dirty = true;
     stepMap(e, now);
     // a play-through whose loads can't keep up goes on as drafts (the scrub's), so it plays, not stalls on
-    // a half-empty map; paused, the full frame comes back
-    const tilesNow = st.playing && !st.playDraft ? e.tiles_pending() : 0;
-    if (tilesNow > PLAY_BEHIND_TILES) {
-      st.behindSince ||= now;
-      if (now - st.behindSince >= PLAY_BEHIND_MS) st.playDraft = true;
-    } else st.behindSince = 0;
+    // a half-empty map; once the map has caught up and the frames come in time, the full frame comes back
+    // while it plays (and paused, at once)
+    const tilesNow = st.playing ? e.tiles_pending() : 0;
+    if (st.playing && !st.playDraft) {
+      if (tilesNow > PLAY_BEHIND_TILES) {
+        st.behindSince ||= now;
+        if (now - st.behindSince >= PLAY_BEHIND_MS) {
+          st.playDraft = true;
+          st.draftSince = now;
+          st.caughtUpSince = 0;
+        }
+      } else st.behindSince = 0;
+    } else if (st.playing) {
+      if (tilesNow <= PLAY_CAUGHT_UP_TILES && framesOnTime(now)) {
+        st.caughtUpSince ||= now;
+        if (now - st.caughtUpSince >= PLAY_CAUGHT_UP_MS && now - st.draftSince >= PLAY_DRAFT_HOLD_MS) {
+          st.playDraft = false;
+          st.behindSince = 0;
+        }
+      } else st.caughtUpSince = 0;
+    }
     if (!st.playing) st.playDraft = false;
     // a draft while the playhead is dragged (when asked for), or a play-through's (which loads every tile);
     // the full frame the moment either stops
@@ -890,9 +974,19 @@ function draw(now) {
  * again in one frame cancels its old request, not the new one (as the tiles' aborts go first in Rust). */
 function handOut() {
   const e = st.engine;
+  // (one batch: cancels, new jobs and promotions all in, then the queue goes out once, in its order)
+  st.pool.hold();
+  try {
+    handOutBatch(e);
+  } finally {
+    st.pool.release();
+  }
+}
+
+function handOutBatch(e) {
   for (const id of e.take_tile_cancels()) st.pool.cancel(id);
   const jobs = e.take_tile_jobs();
-  for (let i = 0; i < jobs.length; i += 2) st.pool.tile(jobs[i], jobs[i + 1]);
+  for (let i = 0; i < jobs.length; i += 3) st.pool.tile(jobs[i], jobs[i + 1], jobs[i + 2]);
   for (const src of e.take_file_cancels()) st.pool.cancelFile(src);
   const files = e.take_file_requests();
   for (let i = 0; i < files.length; i += 2) st.pool.file(files[i], files[i + 1]);
@@ -900,7 +994,14 @@ function handOut() {
   const detail = e.take_detail_jobs();
   for (let i = 0; i < detail.length; i += 2) st.pool.detail(detail[i], detail[i + 1]);
   const cpu = e.take_cpu_jobs();
-  for (let i = 0; i < cpu.length; i += 2) st.pool.cpu(cpu[i], cpu[i + 1]);
+  for (let i = 0; i < cpu.length; i += 3) st.pool.cpu(cpu[i], cpu[i + 1], cpu[i + 2]);
+}
+
+/** Whether the last second's frames were drawn in time for the film's beat (three in four of them within
+ * `FRAME_GAP`): a play draft only ends when the full frame can keep up too. */
+function framesOnTime(now) {
+  const recent = st.costs.filter(([at]) => now - at < 1000).map(([, c]) => c).sort((a, b) => a - b);
+  return recent.length > 0 && recent[Math.floor(recent.length * 0.75)] < FRAME_GAP;
 }
 
 function frameStats(now) {
