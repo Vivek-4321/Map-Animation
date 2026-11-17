@@ -102,6 +102,7 @@ const KINDS = {
   highlight: ["Country highlight", "How countries light up"],
   label: ["Place labels", "How place names come in"],
   entrance: ["Photo entrance", "How the photo comes in"],
+  style: ["Map style", "Pick a map style"],
 };
 /** a stop's or leg's own choice "": the trip's; the trip's own "none" where the catalogue has no such choice */
 const TRIPS = { key: "", name: "Trip's choice", about: "As set for the whole trip, in Story." };
@@ -142,7 +143,7 @@ const curvedLegs = () => state.template !== "orbit";
 const isStory = () => state.template === "story";
 
 const state = { template: "orbit", title: "", shape: "16:9", color: "#00a9df", duration: 0, camera: "fit", trailCamera: "orbit", trailDistance: 1,
-  swap: "smooth", highlight: "flag", labelStyle: "stamp", effect: "none", storyCamera: "steady", stops: [] };
+  swap: "smooth", highlight: "flag", labelStyle: "stamp", effect: "none", mapStyle: "Maps", storyCamera: "steady", stops: [] };
 let nextId = 1;
 let preview = null;
 let rebuildVersion = 0;
@@ -615,7 +616,7 @@ async function travelJson() {
     return o;
   });
   const meta = { title: state.title, color: state.color, camera: state.storyCamera, steady: 3, modelTransition: state.swap,
-    duration: state.duration || storyLength() };
+    style: state.mapStyle, duration: state.duration || storyLength() };
   if (state.labelStyle !== "none") meta.labelStyle = state.labelStyle;
   if (state.effect !== "none") meta.effect = state.effect;
   if (state.highlight === "flag") meta.flags = true;
@@ -802,8 +803,8 @@ function wireSettings() {
   fitFrame();
 }
 
-/** the Story block: the trip's swap, highlight, labels and effect, each a card that opens its picker */
-const TRIP_CHOICES = [["swap", "swap"], ["highlight", "highlight"], ["label", "labelStyle"], ["effect", "effect"]];
+/** the Story block: the trip's map style, swap, highlight, labels and effect, each a card that opens its picker */
+const TRIP_CHOICES = [["style", "mapStyle"], ["swap", "swap"], ["highlight", "highlight"], ["label", "labelStyle"], ["effect", "effect"]];
 function renderStoryChoices() {
   $("storyChoices").innerHTML = TRIP_CHOICES.map(([kind, field]) =>
     `<button type="button" class="story-choice" data-kind="${kind}"><span>${KINDS[kind][0]}</span><b>${esc(choiceName(kind, state[field]))}</b></button>`).join("");
@@ -826,7 +827,7 @@ const resolved = (kind, key) =>
   key !== "" ? key : kind in TRIP_FIELD ? state[TRIP_FIELD[kind]] : kind === "entrance" ? AUTO_ENTRANCES[(picking.i ?? 0) % 4] : key;
 
 /** The kinds whose choices show as pictures (tools/web-picker-thumbs.py renders them with the engine). */
-const PICK_PICTURES = new Set(["vehicle", "effect"]);
+const PICK_PICTURES = new Set(["vehicle", "effect", "style"]);
 /** Choice `key` of `kind` as its transparent picture; a stop's "" is the trip's (an effect), or the default
  * vehicle. One not rendered yet is no picture. */
 function pickPicture(kind, key) {
@@ -846,7 +847,7 @@ async function openPicker(kind, i) {
   $("pickerTitle").textContent = KINDS[kind][1];
   const list = choices(kind, s !== null && kind !== "vehicle" && kind !== "entrance");
   $("pickerList").innerHTML = list.map((c) =>
-    `<button type="button" class="pick${PICK_PICTURES.has(kind) ? " has-pic" : ""}${c.key === picking.chosen ? " on" : ""}" role="option" aria-selected="${c.key === picking.chosen}" data-key="${esc(c.key)}" title="${esc(c.about)}">${pickPicture(kind, c.key)}<b>${esc(c.name)}</b></button>`).join("");
+    `<button type="button" class="pick pick-${kind}${PICK_PICTURES.has(kind) ? " has-pic" : ""}${c.key === picking.chosen ? " on" : ""}" role="option" aria-selected="${c.key === picking.chosen}" data-key="${esc(c.key)}" title="${esc(c.about)}">${pickPicture(kind, c.key)}<b>${esc(c.name)}</b></button>`).join("");
   // (the preview changes only when a choice is picked, not as the pointer passes over the others)
   for (const el of $("pickerList").querySelectorAll(".pick")) {
     el.onclick = () => {
@@ -981,7 +982,7 @@ function save() {
 }
 
 const FRESH = { template: "orbit", title: "", shape: "16:9", color: "#00a9df", duration: 0, camera: "fit", trailCamera: "orbit", trailDistance: 1,
-  swap: "smooth", highlight: "flag", labelStyle: "stamp", effect: "none", storyCamera: "steady", stops: [] };
+  swap: "smooth", highlight: "flag", labelStyle: "stamp", effect: "none", mapStyle: "Maps", storyCamera: "steady", stops: [] };
 
 /** A template's own starting look over `FRESH`: a Story trip starts on TravelBoast's red route, flowers along
  * every leg and each country lit by its flag. A kept item's own settings stay its own. */
