@@ -7,6 +7,8 @@ import { DrawnView } from "./drawn-view.js";
 import { REMOTE_LOG, startRemoteLog } from "./remote-log.js";
 if (REMOTE_LOG) startRemoteLog("page");
 const NO_MAP_WORKER = new URLSearchParams(location.search).has("nomapworker");
+/** `?maptiles=1`: the preview's street map drawn as tiles, each painted once (`Engine::set_map_tiles`). */
+const MAP_TILES = new URLSearchParams(location.search).get("maptiles") === "1";
 
 /** `?gl` in the page's address: the engine on WebGL2 even where there is WebGPU, to see what an old phone
  * sees. Read as the module loads, before the page rewrites its address. */
@@ -32,7 +34,7 @@ export async function startEngine(canvas, status = () => {}, resolution = "720",
     preview.onReady = resolve;
     preview.onStartFailed = reject;
     preview.statusNote = status;
-    worker.postMessage({ kind: "start", canvas: offscreen, w, h, template, webgl: WEBGL, lowMemory: LOW_MEMORY, remotelog: REMOTE_LOG, noMapWorker: NO_MAP_WORKER }, [offscreen]);
+    worker.postMessage({ kind: "start", canvas: offscreen, w, h, template, webgl: WEBGL, lowMemory: LOW_MEMORY, remotelog: REMOTE_LOG, noMapWorker: NO_MAP_WORKER, mapTiles: MAP_TILES }, [offscreen]);
   });
   preview.onStartFailed = null;
   preview.size = { w, h };
@@ -103,6 +105,8 @@ export class Preview extends EventTarget {
           this.playing = m.playing;
           this.playDraft = m.playDraft;
         }
+        // a play-through's clock waiting for its first seconds (render-worker `holdRunway`)
+        this.buffering = !!m.buffering;
         this.pending = m.pending;
         this.stats = m.stats;
         this.diag = m.diag;
@@ -126,6 +130,7 @@ export class Preview extends EventTarget {
       case "snapshot":
       case "profile":
       case "trace":
+      case "timeline":
       case "country-at":
       case "country-outline":
       case "country-names":
@@ -363,6 +368,29 @@ export class Preview extends EventTarget {
 
   cancelExport() {
     this.worker.postMessage({ kind: "export-cancel" });
+  }
+
+  /** Start the run's timeline: every worker records its events (the engine's frames, steps, map paints,
+   * loads; the workers' ticks and messages) until `stopTimeline`. */
+  startTimeline() {
+    this.worker.postMessage({ kind: "timeline", on: true });
+    this.timelineFrom = performance.timeOrigin + performance.now();
+  }
+
+  /** Stop the run's timeline: every worker's events as one Chrome trace file (JSON text), for Perfetto
+   * (ui.perfetto.dev) or tools/timeline-summary.py. */
+  async stopTimeline() {
+    const m = await this.call({ kind: "timeline", on: false });
+    const page = JSON.stringify({ ph: "M", name: "process_name", pid: 1, tid: 0, args: { name: "page" } });
+    const meta = JSON.stringify({ ph: "i", s: "g", name: "timeline started", cat: "js", pid: 1, tid: 0, ts: (this.timelineFrom || 0) * 1000 });
+    return `{"traceEvents":[${[page, meta, m.json].filter(Boolean).join(",")}]}`;
+  }
+
+  /** The run's timeline over the next `ms` (`startTimeline`, `stopTimeline`). */
+  async timeline(ms = 15000) {
+    this.startTimeline();
+    await new Promise((r) => setTimeout(r, ms));
+    return this.stopTimeline();
   }
 
   /** A trace of the render thread's loop over `ms`: one entry a tick (its time, the gap since the last,

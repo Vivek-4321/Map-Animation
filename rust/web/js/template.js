@@ -726,7 +726,15 @@ function veil(text) {
  * while it plays: the clock says when it plays drafts). Nothing over the veil. */
 function showBusy() {
   const waiting = preview?.loaded && !preview.playing && preview.pending > 0;
-  const text = !$("veil").hidden ? null : updating ? "Updating the film…" : waiting ? "Loading the map…" : null;
+  const text = !$("veil").hidden
+    ? null
+    : updating
+      ? "Updating the film…"
+      : preview?.playing && preview.buffering
+        ? "Preparing the film…"
+        : waiting
+          ? "Loading the map…"
+          : null;
   $("busy").hidden = !text;
   if (text && $("busy").textContent !== text) $("busy").textContent = text;
 }
@@ -995,6 +1003,20 @@ const TEMPLATE_LOOK = { story: { color: "#ec0003", effect: "flowers", highlight:
 function takeState(kept) {
   Object.assign(state, FRESH, TEMPLATE_LOOK[templateOf(kept.template)], kept, { stops: (kept.stops || []).map((s) => ({ ...newStop(s), ...s, id: nextId++, images: [] })) });
   state.template = templateOf(state.template);
+}
+
+/** The item kept in the file at `url` (`?open=`), in the editor. */
+function openFile(url) {
+  fetch(url)
+    .then((r) => {
+      if (!r.ok) throw new Error(`${url}: ${r.status}`);
+      return r.json();
+    })
+    .then((kept) => {
+      hideHome();
+      applyState(kept);
+    })
+    .catch((err) => veil(`Could not open ${url}: ${err.message}`));
 }
 
 /** `kept` in the editor: its settings, its stops on the globe and in the list, its film rebuilt. */
@@ -1716,8 +1738,13 @@ $("homeBack").onclick = hideHome;
 
 const query = new URLSearchParams(location.search);
 const asked = query.get("item");
+// (`?open=URL`: an item kept in a file, as the library keeps one: the same story on any origin, whose
+// library is its own; the timeline page opens its stories so)
+const openUrl = query.get("open");
 // an item of the library by its id, or something new with a template (?template=orbit or region)
-const opened = asked ? libraryItem(asked) : query.has("template") ? { template: templateOf(query.get("template")) } : null;
+// (`&example`: the template's example trip, as the home page's "Example" starts it)
+const askedTemplate = query.has("template") ? templateOf(query.get("template")) : null;
+const opened = asked ? libraryItem(asked) : askedTemplate ? { template: askedTemplate, ...(query.has("example") ? TEMPLATES[askedTemplate]?.example : {}) } : null;
 if (opened) {
   currentId = asked && libraryItem(asked) ? asked : null;
   takeState(opened);
@@ -1752,7 +1779,8 @@ startEngine($("canvas"), (note) => veil(note), quality, "multdev")
       renderStoryChoices();
     }).catch(() => {});
     state.stops.forEach(countryOf);
-    rebuild();
+    if (openUrl) openFile(openUrl);
+    else rebuild();
   })
   .finally(() => {
     $("routeMap").innerHTML = "";

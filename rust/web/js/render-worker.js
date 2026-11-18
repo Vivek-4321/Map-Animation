@@ -6,8 +6,9 @@
 // not; arrivals land between frames and each landing is drawn on the next beat, with a couple of frames
 // after it; while the frame is still changing by itself (a tile fading in, detail coming back after a move)
 // it is drawn on the beat until it is done; a moment still waiting for loads is drawn again slowly.
-import init, { WebEngine, WebFiles, last_panic, startup_files, multdev_story, trail_story, travelboast_story, showcase_catalog, showcase_story, export_frames, source_max_age_s, preview_scale_rules } from "../pkg/map_web.js";
-import { LoadPool, compile, sourceUrl } from "./loads.js";
+import init, { WebEngine, WebFiles, last_panic, startup_files, multdev_story, trail_story, travelboast_story, showcase_catalog, showcase_story, export_frames, source_max_age_s, preview_scale_rules, timeline_set, timeline_lane, timeline_now_us, timeline_take } from "../pkg/map_web.js";
+import { setTimeline, takeTimeline, timelineOn, jsSpan, jsMark, jsCounter, nowUs } from "./run-timeline.js";
+import { CPU_FAST_WORKERS, LoadPool, compile, sourceUrl } from "./loads.js";
 import { remoteLog, startRemoteLog } from "./remote-log.js";
 import { Muxer, ArrayBufferTarget, StreamTarget } from "../vendor/mp4-muxer.mjs";
 
@@ -25,6 +26,14 @@ const BUFFER_GAP = 100;
 const PLAY_BEHIND_TILES = 16;
 /** ...once it has been behind this long (ms): tiles coming from the cache catch up within it */
 const PLAY_BEHIND_MS = 1000;
+/** A play-through's clock waits at its start for what its first seconds read (the engine's look-ahead
+ * over them, asked for at once: `prepare_runway`), as Android's preview buffers before it plays: until this
+ * few loads are still to come (`runway_pending`)... */
+const RUNWAY_READY_LOADS = 2;
+/** ...or this long at most (ms), so a slow network never holds it for good... */
+const RUNWAY_MAX_MS = 8000;
+/** ...and the page shows it waits only past this (ms): a quick start flashes no loader. */
+const RUNWAY_SHOW_MS = 250;
 /** A play-through's draft ends while it plays once its map has caught up: this few tiles still to come... */
 const PLAY_CAUGHT_UP_TILES = 2;
 /** ...for this long (ms), its frames drawn in time meanwhile (`framesOnTime`)... */
@@ -120,6 +129,7 @@ const st = {
   traceAt: 0, // the last traced tick's time
   tickInfo: null, // what this tick met and did, for the trace
   seq: 0, // the page's last clock command, echoed back with the clock
+  runway: 0, // while a play-through's clock waits for its first seconds (`holdRunway`): since when (ms)
 };
 
 const post = (m, transfer) => self.postMessage(m, transfer || []);
@@ -248,10 +258,19 @@ self.onmessage = async (e) => {
         if (st.exporting) return;
         if (st.t >= filmEnd() - RESTART_S) st.t = 0;
         st.playing = true;
+        // its first seconds asked for at once, the clock held until they are in (`holdRunway`)
+        st.runway = st.engine && st.loaded ? performance.now() : 0;
+        if (st.runway) st.engine.prepare_runway(st.t);
+        st.dirty = true;
         // (each play-through starts full: the last one's tiles may all be in by now)
         st.playDraft = false;
         st.behindSince = 0;
         st.last = performance.now();
+        return;
+      case "map-tiles":
+        // (the preview's street map as tiles painted once, or the whole-view print: for comparing the two)
+        st.engine?.set_map_tiles(!!m.on);
+        st.dirty = true;
         return;
       case "map-worker":
         // (the preview's map painted on the map worker, or here: for comparing the two)
@@ -262,6 +281,7 @@ self.onmessage = async (e) => {
         return;
       case "pause":
         st.playing = false;
+        st.runway = 0;
         st.playDraft = false;
         sendStatus(true);
         return;
@@ -336,6 +356,11 @@ self.onmessage = async (e) => {
         // a video an export left in the origin's storage, which the page has done with
         if (/^export-\d+\.mp4$/.test(m.name)) await (await self.navigator.storage.getDirectory()).removeEntry(m.name).catch(() => {});
         return;
+      case "timeline":
+        // the run's timeline (the page's `Preview.timeline`): on here and on the map and tile workers; off,
+        // each hands its part over and the page gets them together
+        if (m.on) return void timelineStart();
+        return void timelineCollect().then((json) => post({ kind: "timeline", id: m.id, json }));
       case "trace":
         // a per-tick trace of the loop (the page's `Preview.trace`): when each tick ran, what it drew and
         // what that cost, with the engine's own spans of each frame drawn
@@ -386,7 +411,7 @@ const EDITOR_FACES = ["Inter", "Montserrat", "Caveat", "Cinzel", "LuckiestGuy"];
 const ESSENTIAL_FACES = ["Inter"];
 const STARTUP_FONT_GRACE_MS = 1500;
 
-async function start({ canvas, w, h, template, webgl, lowMemory, remotelog, noMapWorker }) {
+async function start({ canvas, w, h, template, webgl, lowMemory, remotelog, noMapWorker, mapTiles }) {
   // TEMPORARY (Safari black-map diagnosis)
   st.remotelog = !!remotelog;
   LoadPool.remotelog = st.remotelog;
@@ -444,10 +469,13 @@ async function start({ canvas, w, h, template, webgl, lowMemory, remotelog, noMa
     setInterval(probeFrame, 15000);
   }
   st.pool = new LoadPool(module, answer);
+  // (the engine hands the pool's CPU workers two jobs each)
+  st.engine.set_cpu_workers(CPU_FAST_WORKERS);
   // the workers compress tiles to the store's format (desktop BC7, a phone's ASTC), as Android's do
   st.pool.format = st.engine.tile_format();
   startTileWorkers(module);
   startMapWorker(module);
+  if (mapTiles) st.engine.set_map_tiles(true);
   // the preview adapts to this device's frame times, as the apps' previews do (`applyScale`)
   st.scaleRules = preview_scale_rules();
   st.engine.start_preview_governor(Math.round(1000 / FRAME_GAP));
@@ -519,6 +547,7 @@ function startMapWorker(module) {
   const fonts = rows.map((r) => r[1]);
   w.postMessage({ kind: "init", module, names: rows.map((r) => r[0]), fonts, port: ch.port2, remotelog: st.remotelog }, [ch.port2, ...fonts.map((f) => f.buffer)]);
   w.onmessage = (e) => {
+    if (e.data.kind === "timeline-out") return timelineOut(w, e.data.json);
     if (st.remotelog) remoteLog("render", "[map worker] says", e.data.kind, e.data.error ?? "", "| painting there:", st.mapWorkerOn);
     if (e.data.kind === "ready") {
       if (st.mapWorkerStarting !== mine) return;
@@ -598,6 +627,7 @@ function mapPicture({ painted, meshes, bitmap, ms }) {
     return failed(err);
   }
   if (st.trace) st.traceAnswers.push({ at: t0, ms: performance.now() - t0, kind: "map-picture", src: ms.toFixed(1), bytes: 0 });
+  jsMark("map picture in", { worker_ms: ms, painted: !!painted, copy_ms: performance.now() - t0 });
   st.dirty = true;
   wake();
 }
@@ -620,6 +650,7 @@ function startTileWorkers(module) {
     console.warn(`map tile workers: ${why}; the map's tiles are built here from now on`);
     for (const t of st.tileWorkers) t.terminate();
     st.tileWorkers = [];
+    st.mapTilePorts = [];
     if (!st.dead && st.engine) st.engine.tile_workers_lost();
     st.tileAnswer?.();
     st.dirty = true;
@@ -631,6 +662,7 @@ function startTileWorkers(module) {
     const fonts = rows.map((r) => r[1]);
     w.postMessage({ kind: "init", module, names: rows.map((r) => r[0]), fonts, remotelog: st.remotelog }, fonts.map((f) => f.buffer));
     w.onmessage = (e) => {
+      if (e.data.kind === "timeline-out") return timelineOut(w, e.data.json);
       if (st.dead || !st.engine) return;
       if (e.data.kind === "answer") {
         st.engine.tile_worker_answer(e.data.bytes);
@@ -647,6 +679,18 @@ function startTileWorkers(module) {
     w.onmessageerror = () => lost("an answer could not be read");
     st.tileWorkers.push(w);
   }
+  // the street map's tiles (`printed_map::tiles`) build on the same workers, on a port each of their own
+  st.mapTilePorts = st.tileWorkers.map((t) => {
+    const ch = new MessageChannel();
+    t.postMessage({ kind: "port", port: ch.port1 }, [ch.port1]);
+    ch.port2.onmessage = (e) => {
+      if (st.dead || !st.engine || e.data.kind !== "answer") return;
+      st.engine.map_tile_worker_answer(e.data.bytes);
+      st.dirty = true;
+      wake();
+    };
+    return ch.port2;
+  });
   st.engine.set_tile_workers(n);
 }
 
@@ -676,6 +720,12 @@ function flushTileWorkers() {
   for (const [i, bytes] of st.engine.tile_worker_messages()) {
     st.tileWorkers[i % st.tileWorkers.length].postMessage({ kind: "msg", bytes }, [bytes.buffer]);
   }
+  // (the street map's tiles', on their ports)
+  if (st.mapTilePorts?.length) {
+    for (const [i, bytes] of st.engine.map_tile_worker_messages()) {
+      st.mapTilePorts[i % st.mapTilePorts.length].postMessage({ kind: "msg", bytes }, [bytes.buffer]);
+    }
+  }
 }
 
 /** What the page says this device is: a phone or tablet, and its memory (Chromium tells, in GB). */
@@ -689,6 +739,15 @@ function device() {
 
 function answer(m) {
   if (st.dead) return;
+  if (timelineOn()) {
+    const tl = nowUs();
+    try {
+      answerNow(m);
+    } finally {
+      jsSpan(`answer: ${m.kind}`, tl, { id: m.id, src: m.src || "", bytes: m.bytes?.byteLength || m.levels?.byteLength || m.rgba?.byteLength || 0 });
+    }
+    return;
+  }
   if (st.trace) {
     const t0 = performance.now();
     try {
@@ -776,6 +835,17 @@ function active() {
  * flag's, a tile's). One kept waiting `CPU_LAND_WAIT_MS` lands anyway, before any other. Each shows in the
  * next frame. `now`: this tick's frame time. */
 function landCpu(now) {
+  const tl = timelineOn() ? nowUs() : 0;
+  const before = st.cpuWaiting.length;
+  try {
+    landCpuNow(now);
+  } finally {
+    if (tl) jsSpan("land CPU jobs", tl, { landed: before - st.cpuWaiting.length, left: st.cpuWaiting.length });
+  }
+}
+
+/** `landCpu`, untimed. */
+function landCpuNow(now) {
   const e = st.engine;
   // the next frame: the beat after the last one drawn when frames are coming, else a beat from now
   const coming = st.playing || st.dirty || st.moving || st.scrubbing || st.settle > 0 || st.transitioning;
@@ -814,6 +884,8 @@ function landCpu(now) {
 function tick(now) {
   scheduled = false;
   const t0 = performance.now();
+  const tl = timelineOn() ? nowUs() : 0;
+  st.tlDrew = false;
   if (st.trace) st.tickInfo = { drawn: false };
   try {
     step(now);
@@ -821,6 +893,10 @@ function tick(now) {
     failed(err);
   } finally {
     if (st.trace) traceTick(now, t0);
+    if (tl) {
+      jsSpan(st.tlDrew ? "tick: frame drawn" : "tick", tl, { t: st.t, playing: !!st.playing, pending: st.lastPending });
+      jsCounter("loads waiting", st.lastPending || 0);
+    }
     if (active()) wake();
     else if (!scheduled) {
       scheduled = true;
@@ -831,6 +907,46 @@ function tick(now) {
       }, 250);
     }
   }
+}
+
+/** The engine's timeline functions (this worker's module). */
+const TIMELINE_WASM = { timeline_set, timeline_lane, timeline_now_us, timeline_take };
+/** How long a worker may take to hand its part of the timeline over (ms). */
+const TIMELINE_TAKE_MS = 5000;
+
+/** The run's timeline on, here and on the map and tile workers. */
+function timelineStart() {
+  setTimeline(true, TIMELINE_WASM, "render");
+  st.mapWorker?.worker.postMessage({ kind: "timeline", on: true });
+  st.tileWorkers?.forEach((w, i) => w.postMessage({ kind: "timeline", on: true, index: i }));
+}
+
+/** The run's timeline off, and every worker's part of it (Chrome trace events, comma-joined). */
+async function timelineCollect() {
+  setTimeline(false, TIMELINE_WASM);
+  const parts = [takeTimeline(TIMELINE_WASM, 2, "render worker")];
+  const ask = (w, extra) =>
+    new Promise((resolve) => {
+      const done = setTimeout(() => resolve(""), TIMELINE_TAKE_MS);
+      st.timelineWaits = st.timelineWaits || new Map();
+      st.timelineWaits.set(w, (json) => {
+        clearTimeout(done);
+        resolve(json);
+      });
+      w.postMessage({ kind: "timeline", on: false, take: true, ...extra });
+    });
+  const others = [];
+  if (st.mapWorker) others.push(ask(st.mapWorker.worker));
+  st.tileWorkers?.forEach((w, i) => others.push(ask(w, { index: i })));
+  for (const json of await Promise.all(others)) if (json) parts.push(json);
+  return parts.join(",");
+}
+
+/** A worker's part of the timeline came in. */
+function timelineOut(w, json) {
+  const got = st.timelineWaits?.get(w);
+  st.timelineWaits?.delete(w);
+  got?.(json);
 }
 
 /** One tick in the trace: when it ran (`at`, the frame clock), how long since the last (`gap`), its whole
@@ -891,11 +1007,22 @@ function paceLook() {
   return true;
 }
 
+/** Whether a play-through's clock still waits at its start (`RUNWAY_*`): it starts once what its first
+ * seconds read is in, or it has waited `RUNWAY_MAX_MS`. Frames are drawn meanwhile, so the loads land. */
+function holdRunway(now) {
+  if (!st.runway) return false;
+  if (!st.loaded || st.dead || st.engine.runway_pending() <= RUNWAY_READY_LOADS || now - st.runway >= RUNWAY_MAX_MS) {
+    st.runway = 0;
+    return false;
+  }
+  return true;
+}
+
 function step(now) {
   const gap = now - st.last;
   const dt = Math.min(0.1, gap / 1000);
   st.last = now;
-  if (st.playing) {
+  if (st.playing && !holdRunway(now)) {
     st.t += dt;
     // a showcase loops its stretch
     if (st.loop && st.t >= st.loop[1]) st.t = st.loop[0] + ((st.t - st.loop[1]) % Math.max(0.1, st.loop[1] - st.loop[0]));
@@ -914,7 +1041,8 @@ function step(now) {
     // a half-empty map; once the map has caught up and the frames come in time, the full frame comes back
     // while it plays (and paused, at once)
     const tilesNow = st.playing ? e.tiles_pending() : 0;
-    if (st.playing && !st.playDraft) {
+    // (not while the clock waits for the first seconds: those are the whole frame, not a draft)
+    if (st.playing && !st.playDraft && !st.runway) {
       if (tilesNow > PLAY_BEHIND_TILES) {
         st.behindSince ||= now;
         if (now - st.behindSince >= PLAY_BEHIND_MS) {
@@ -985,6 +1113,7 @@ function draw(now) {
   try {
     const t0 = performance.now();
     e.frame(st.t);
+    st.tlDrew = true;
     const t1 = performance.now();
     flushTileWorkers();
     const t2 = performance.now();
@@ -1092,6 +1221,7 @@ function sendStatus(force, now = performance.now()) {
     t: st.t,
     playing: st.playing,
     playDraft: st.playDraft,
+    buffering: !!st.runway && now - st.runway >= RUNWAY_SHOW_MS,
     pending: st.dead ? 0 : st.engine.pending() + st.pool.loading,
     stats,
     diag: st.diag,

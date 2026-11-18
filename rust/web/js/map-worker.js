@@ -9,7 +9,10 @@
 //   -> on the port: { painted, meshes, bitmap, ms }  a picture (painted: what it is; meshes: its building
 //                                                  meshes not sent before), and the paint's time
 //   -> { kind: "ready" } | { kind: "failed", error }
-import init, { WebMapWorker } from "../pkg/map_web.js";
+import init, { WebMapWorker, timeline_set, timeline_lane, timeline_now_us, timeline_take } from "../pkg/map_web.js";
+import { setTimeline, takeTimeline, jsSpan, nowUs } from "./run-timeline.js";
+
+const TIMELINE_WASM = { timeline_set, timeline_lane, timeline_now_us, timeline_take };
 
 let worker = null;
 let canvas = null;
@@ -47,6 +50,7 @@ function handle(rows) {
 
 function paint(bytes) {
   const t0 = performance.now();
+  const tl = nowUs();
   let painted;
   try {
     painted = worker.paint(bytes);
@@ -63,10 +67,17 @@ function paint(bytes) {
   const transfer = [bitmap, painted.buffer];
   if (meshes) transfer.push(meshes.buffer);
   port.postMessage({ painted, meshes, bitmap, ms: performance.now() - t0 }, transfer);
+  jsSpan("map worker paint + hand over", tl);
 }
 
 self.onmessage = async (e) => {
   const m = e.data;
+  if (m.kind === "timeline") {
+    // the run's timeline (the render worker's `timelineStart`/`timelineCollect`)
+    setTimeline(m.on, TIMELINE_WASM, "map worker");
+    if (m.take) self.postMessage({ kind: "timeline-out", json: takeTimeline(TIMELINE_WASM, 3, "map worker") });
+    return;
+  }
   if (m.kind !== "init") return;
   port = m.port;
   remotelog = !!m.remotelog;

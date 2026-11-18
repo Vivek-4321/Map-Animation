@@ -411,12 +411,38 @@ export class WebEngine {
         return v1;
     }
     /**
+     * A tile worker's answer on the street map's tiles' channel.
+     * @param {Uint8Array} bytes
+     */
+    map_tile_worker_answer(bytes) {
+        const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.webengine_map_tile_worker_answer(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * The messages for the tile workers from the street map's tiles, on their own channel (each worker's
+     * map-tile port): `[worker, bytes]` rows.
+     * @returns {Array<any>}
+     */
+    map_tile_worker_messages() {
+        const ret = wasm.webengine_map_tile_worker_messages(this.__wbg_ptr);
+        return ret;
+    }
+    /**
      * Loads the frame on screen still waits for (0: it is complete).
      * @returns {number}
      */
     pending() {
         const ret = wasm.webengine_pending(this.__wbg_ptr);
         return ret >>> 0;
+    }
+    /**
+     * Before a play-through from `t`: what its first seconds read (the look-ahead's moments) asked for at
+     * once, not a moment a frame as playing does (`runway_pending` says when it is in).
+     * @param {number} t
+     */
+    prepare_runway(t) {
+        wasm.webengine_prepare_runway(this.__wbg_ptr, t);
     }
     /**
      * The render scale the governor asks for (1: full size).
@@ -541,6 +567,24 @@ export class WebEngine {
         wasm.webengine_resize(this.__wbg_ptr, width, height);
     }
     /**
+     * What a play-through's first seconds still wait on: the frame's own loads, the look-ahead's files
+     * still to come (`prepare_runway`), and the map on show still settling (its labels placed and faded
+     * in, the street map's tiles painted: `Engine::map_settling`).
+     * @returns {number}
+     */
+    runway_pending() {
+        const ret = wasm.webengine_runway_pending(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * The page prepares the CPU jobs that aren't models (vector tiles, images, files) on `count` Web
+     * Workers: two of them are handed out a worker (`Session::set_cpu_workers`).
+     * @param {number} count
+     */
+    set_cpu_workers(count) {
+        wasm.webengine_set_cpu_workers(this.__wbg_ptr, count);
+    }
+    /**
      * Draft frames while the playhead is dragged (`Session::set_draft`).
      * @param {boolean} on
      */
@@ -558,6 +602,13 @@ export class WebEngine {
      */
     set_look(lon, lat, dist, pitch, bearing) {
         wasm.webengine_set_look(this.__wbg_ptr, lon, lat, dist, pitch, bearing);
+    }
+    /**
+     * Draw the preview's street map as tiles, each painted once and kept (`Engine::set_map_tiles`).
+     * @param {boolean} on
+     */
+    set_map_tiles(on) {
+        wasm.webengine_set_map_tiles(this.__wbg_ptr, on);
     }
     /**
      * The view is moved by hand, or has stopped (`Session::set_moving`).
@@ -1330,6 +1381,56 @@ export function tile_levels(rgba, format) {
         wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     }
     return v2;
+}
+
+/**
+ * Name the lane this worker's events go on.
+ * @param {string} name
+ */
+export function timeline_lane(name) {
+    const ptr0 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    wasm.timeline_lane(ptr0, len0);
+}
+
+/**
+ * The timeline's clock now (µs since its zero): the page lines workers up with it.
+ * @returns {number}
+ */
+export function timeline_now_us() {
+    const ret = wasm.timeline_now_us();
+    return ret;
+}
+
+/**
+ * Record this worker's timeline (or stop).
+ * @param {boolean} on
+ */
+export function timeline_set(on) {
+    wasm.timeline_set(on);
+}
+
+/**
+ * This worker's events since the last call, as Chrome trace events (comma-separated, no brackets), every
+ * time moved by `origin_us`, under process `pid` named `process`.
+ * @param {number} origin_us
+ * @param {number} pid
+ * @param {string} process
+ * @returns {string}
+ */
+export function timeline_take(origin_us, pid, process) {
+    let deferred2_0;
+    let deferred2_1;
+    try {
+        const ptr0 = passStringToWasm0(process, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.timeline_take(origin_us, pid, ptr0, len0);
+        deferred2_0 = ret[0];
+        deferred2_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+    }
 }
 
 /**
@@ -3635,18 +3736,18 @@ function __wbg_get_imports() {
             arg0.writeTexture(arg1, getArrayU8FromWasm0(arg2, arg3), arg4, arg5);
         }, arguments); },
         __wbindgen_generic_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 2476, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 2494, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue______true_);
             return ret;
         },
         __wbindgen_generic_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 4477, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 4495, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue__core_ed718c3d60ebd546___result__Result_____wasm_bindgen_d5062a7ed11bff87___JsError___true_);
             return ret;
         },
         __wbindgen_generic_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("GPUUncapturedErrorEvent")], shim_idx: 2476, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue______true__112);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("GPUUncapturedErrorEvent")], shim_idx: 2494, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue______true__122);
             return ret;
         },
         __wbindgen_generic_0000000000000004: function(arg0) {
@@ -3714,8 +3815,8 @@ function wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bin
     wasm.wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue______true_(arg0, arg1, arg2);
 }
 
-function wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue______true__112(arg0, arg1, arg2) {
-    wasm.wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue______true__112(arg0, arg1, arg2);
+function wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue______true__122(arg0, arg1, arg2) {
+    wasm.wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue______true__122(arg0, arg1, arg2);
 }
 
 function wasm_bindgen_d5062a7ed11bff87___convert__closures_____invoke___wasm_bindgen_d5062a7ed11bff87___JsValue__core_ed718c3d60ebd546___result__Result_____wasm_bindgen_d5062a7ed11bff87___JsError___true_(arg0, arg1, arg2) {

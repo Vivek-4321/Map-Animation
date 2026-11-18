@@ -12,6 +12,12 @@ export const sourceUrl = (src) => (/^(https?:|data:|blob:)/.test(src) ? src : ne
 
 /** Android runs four tile threads; one core is left to the render thread and one to the page */
 const WORKERS = Math.min(4, Math.max(2, (self.navigator?.hardwareConcurrency || 4) - 2));
+/** workers preparing vector tiles, images and files (the CPU jobs that aren't models), side by side: a
+ * single one sat idle between the frames that hand jobs out while a fly-in's tiles queued behind it. One
+ * core each is left to the render thread, the page, the map's worker and the model worker. Each holds a
+ * wasm instance of its own, so a small device keeps one. (Rust admits two jobs a worker: map-web's
+ * `CPU_JOBS`, kept to this.) */
+export const CPU_FAST_WORKERS = Math.min(3, Math.max(1, (self.navigator?.hardwareConcurrency || 4) - 4));
 /** downloads one worker has out at once; the rest wait their turn */
 const PER_WORKER = 6;
 /** while the view is moved by hand, at most this many of the view's tile downloads are out at once
@@ -116,10 +122,11 @@ export class LoadPool {
 
   /** Vector preparation and image decodes never queue behind relief builds or tile downloads, and a
    * model's preparation (its parse, textures and levels of detail, the longest job) never queues
-   * before them: models go to a worker of their own (`model`). Rust admits at most two jobs on each;
-   * each worker runs its own in that bounded order. */
+   * before them: models go to a worker of their own (`model`), the rest to the least busy of
+   * `CPU_FAST_WORKERS` (`fastLane`). Rust admits two jobs a worker (map-web's `CPU_JOBS`); each worker
+   * runs its own in that bounded order. */
   cpu(id, bytes, model = false) {
-    const lane = model ? "model" : "fast";
+    const lane = model ? "model" : this.fastLane();
     this.cpuLanes ??= {};
     let c = this.cpuLanes[lane];
     if (!c?.worker) {
@@ -135,6 +142,18 @@ export class LoadPool {
     }
     c.out.add(id);
     c.worker.postMessage({ kind: "cpu", id, bytes }, [bytes.buffer]);
+  }
+
+  /** The fast lane with the fewest jobs out (a worker not started yet has none): a camera flying in asks
+   * for dozens of tiles at once, prepared side by side, not one after another on a single worker. */
+  fastLane() {
+    let best = "fast0";
+    let fewest = Infinity;
+    for (let i = 0; i < CPU_FAST_WORKERS; i++) {
+      const out = this.cpuLanes?.[`fast${i}`]?.out?.size ?? 0;
+      if (out < fewest) [best, fewest] = [`fast${i}`, out];
+    }
+    return best;
   }
 
   /** A long build of `kind` ("detail"): on a worker of its own (the build worker), so one that

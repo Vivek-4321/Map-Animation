@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Run Timeline</title>
+<style>
+  :root { --bg: #f6f5f2; --fg: #1d1d1b; --muted: #6b6a66; --line: #d9d6cf; --accent: #2c5f8a; --card: #ffffff; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg: #161615; --fg: #ecebe7; --muted: #9b9a95; --line: #34332f; --accent: #7fb0dc; --card: #1f1f1d; }
+  }
+  :root[data-theme="dark"] { --bg: #161615; --fg: #ecebe7; --muted: #9b9a95; --line: #34332f; --accent: #7fb0dc; --card: #1f1f1d; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
+  header { padding: 12px 16px; border-bottom: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
+  label { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: var(--muted); }
+  input, select, button { font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--fg); }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  #status { padding: 8px 16px; color: var(--muted); min-height: 1.4em; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 0 16px 16px; }
+  @media (min-width: 900px) { main { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); } }
+  iframe { width: 100%; aspect-ratio: 9 / 16; max-height: 80vh; border: 1px solid var(--line); border-radius: 8px; background: #000; }
+  pre { margin: 0; padding: 12px; background: var(--card); border: 1px solid var(--line); border-radius: 8px; overflow: auto; white-space: pre-wrap; font: 12px/1.45 ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<!-- Records a run of a story's preview as a timeline (every frame, its steps, map paints, loads, on every
+     worker) and sums it up. ?example=orbit|story (a template's example trip) | ?item=ID (this origin's
+     library) | ?open=URL (an item in a file),
+     &secs=N (how long to record), &settle=N (seconds to wait after the preview is ready), &auto=1 (start at
+     once). A script reads `window.timelineResult` ({ summary, text, json }) when it is done. -->
+<header>
+  <label>Story
+    <select id="story"></select>
+  </label>
+  <label>…or item file URL <input id="open" placeholder="timeline-stories/zoom.json" size="28"></label>
+  <label>Record (s) <input id="secs" type="number" value="20" min="2" max="300" style="width:6em"></label>
+  <label>Settle first (s) <input id="settle" type="number" value="3" min="0" max="60" style="width:6em"></label>
+  <button id="load">Load</button>
+  <button id="run" class="primary" disabled>Play and record</button>
+  <button id="save" disabled>Download timeline</button>
+</header>
+<div id="status">Pick a story and load it.</div>
+<main>
+  <iframe id="frame" title="Story preview"></iframe>
+  <pre id="out">The summary shows here after a run. Open the downloaded file in ui.perfetto.dev for the full timeline.</pre>
+</main>
+<script type="module">
+import { summarize, summaryText } from "./js/timeline-summary.js";
+
+const $ = (id) => document.getElementById(id);
+const q = new URLSearchParams(location.search);
+const say = (t) => ($("status").textContent = t);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let json = null;
+
+// this origin's library (the editor's own), newest first
+let items = [];
+try { items = JSON.parse(localStorage.getItem("map-editor-library") || "[]"); } catch {}
+items.sort((a, b) => (b.updated || 0) - (a.updated || 0));
+const opts = [["example:orbit", "Example: orbit (city to city)"], ["example:story", "Example: story (Europe trip)"], ...items.map((i) => [`item:${i.id}`, i.title || i.name || i.id])];
+$("story").innerHTML = opts.map(([v, t]) => `<option value="${v}">${t.replace(/</g, "&lt;")}</option>`).join("");
+if (q.get("item")) $("story").value = `item:${q.get("item")}`;
+if (q.get("example")) $("story").value = `example:${q.get("example")}`;
+if (q.get("open")) $("open").value = q.get("open");
+if (q.get("secs")) $("secs").value = q.get("secs");
+if (q.get("settle")) $("settle").value = q.get("settle");
+
+function src() {
+  // (`?maptiles=1`: the street map drawn as tiles painted once; passed on to the preview)
+  const extra = q.get("maptiles") ? `&maptiles=${encodeURIComponent(q.get("maptiles"))}` : "";
+  return srcOf() + extra;
+}
+
+function srcOf() {
+  const open = $("open").value.trim();
+  if (open) return `template.html?debug=trace&open=${encodeURIComponent(new URL(open, location.href).href)}`;
+  const [kind, v] = $("story").value.split(":");
+  if (kind === "example") return `template.html?debug=trace&template=${encodeURIComponent(v)}&example=1`;
+  return `template.html?debug=trace&${kind}=${encodeURIComponent(v)}`;
+}
+
+/** Until `test` is true (checked every 200 ms), or `ms` passes. */
+async function until(test, ms, what) {
+  const end = performance.now() + ms;
+  for (;;) {
+    try { if (test()) return; } catch {}
+    if (performance.now() > end) throw new Error(`timed out waiting for ${what}`);
+    await sleep(200);
+  }
+}
+
+async function load() {
+  $("run").disabled = true;
+  say("Loading the story…");
+  $("frame").src = src();
+  const w = () => $("frame").contentWindow;
+  await until(() => typeof w().mapPreview === "object", 60000, "the engine");
+  const doc = w().document;
+  // the Preview tab, then a Play button that can be pressed
+  doc.querySelector('.tabs button[data-tab="preview"]')?.click();
+  await until(() => !doc.getElementById("playBtn").disabled, 60000, "the film");
+  $("run").disabled = false;
+  say("Ready. Press “Play and record”.");
+}
+
+async function run() {
+  $("run").disabled = $("save").disabled = true;
+  const w = $("frame").contentWindow;
+  const preview = w.mapPreview;
+  const settle = Number($("settle").value) || 0;
+  const secs = Number($("secs").value) || 20;
+  say(`Settling for ${settle} s…`);
+  await sleep(settle * 1000);
+  preview.startTimeline();
+  w.document.getElementById("playBtn").click();
+  for (let s = secs; s > 0; s--) {
+    say(`Recording… ${s} s left`);
+    await sleep(1000);
+  }
+  say("Gathering every worker's timeline…");
+  json = await preview.stopTimeline();
+  // pause where it got to
+  if (preview.playing) w.document.getElementById("playBtn").click();
+  const summary = summarize(JSON.parse(json));
+  const text = summaryText(summary);
+  $("out").textContent = text;
+  globalThis.timelineResult = { summary, text, json };
+  $("save").disabled = $("run").disabled = false;
+  say(`Done: ${(json.length / 1e6).toFixed(1)} MB of timeline.`);
+}
+
+$("load").onclick = () => load().catch((e) => say(String(e.message || e)));
+$("run").onclick = () => run().catch((e) => say(String(e.message || e)));
+$("save").onclick = () => {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([json], { type: "application/json" }));
+  a.download = `timeline-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+  a.click();
+};
+if (q.get("auto")) load().then(run).catch((e) => { say(String(e.message || e)); globalThis.timelineResult = { error: String(e.message || e) }; });
+</script>
+</body>
+</html>
